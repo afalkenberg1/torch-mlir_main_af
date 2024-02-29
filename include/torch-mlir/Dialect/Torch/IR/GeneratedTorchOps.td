@@ -8925,6 +8925,7 @@ def Torch_Aten_ShapeAsTensorOp : Torch_Op<"aten._shape_as_tensor", [
       printDefaultTorchOp(printer, *this, 1, 1);
     }
   }];
+  let hasFolder = 1;
 }
 
 def Torch_AtenIsnanOp : Torch_Op<"aten.isnan", [
@@ -11231,6 +11232,7 @@ def Torch_AtenIntImplicitOp : Torch_Op<"aten.IntImplicit", [
       printDefaultTorchOp(printer, *this, 1, 1);
     }
   }];
+  let hasCanonicalizer = 1;
 }
 
 def Torch_AtenFloatImplicitOp : Torch_Op<"aten.FloatImplicit", [
@@ -11254,6 +11256,7 @@ def Torch_AtenFloatImplicitOp : Torch_Op<"aten.FloatImplicit", [
       printDefaultTorchOp(printer, *this, 1, 1);
     }
   }];
+  let hasCanonicalizer = 1;
 }
 
 def Torch_AtenTensorFloatOp : Torch_Op<"aten.tensor.float", [
