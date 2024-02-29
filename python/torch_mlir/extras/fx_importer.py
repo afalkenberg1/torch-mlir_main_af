@@ -16,7 +16,18 @@ import operator
 import re
 from dataclasses import dataclass
 from types import BuiltinMethodType, BuiltinFunctionType
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TYPE_CHECKING,
+    Union,
+)
 import weakref
 
 import numpy as np
@@ -44,6 +55,16 @@ from torch.fx import (
     GraphModule,
     Node,
 )
+
+try:
+    from torch.export.graph_signature import InputSpec as TypingInputSpec
+except ModuleNotFoundError:
+    # PyTorch prior to 2.3 is missing certain things we use in typing
+    # signatures. Just make them be Any.
+    if not TYPE_CHECKING:
+        TypingInputSpec = Any
+    else:
+        raise
 
 try:
     import ml_dtypes
@@ -252,7 +273,7 @@ def sparsity_encoding(shape: torch.Size, sparsity: SparsityMeta) -> str:
 
     if sparsity.layout is torch.sparse_coo:
         assert sparse_dim == 2 and blocksize is None  # TODO: deeper sparse dims
-        lvls = f"d{batch_dim}:compressed(nonunique),d{batch_dim+1}:singleton"
+        lvls = f"d{batch_dim}:compressed(nonunique),d{batch_dim+1}:singleton(soa)"
     elif sparsity.layout is torch.sparse_csr:
         assert sparse_dim == 2 and blocksize is None
         lvls = f"d{batch_dim}:dense,d{batch_dim+1}:compressed"
@@ -299,7 +320,7 @@ class InputInfo:
     """Provides additional metadata when resolving inputs."""
 
     program: torch.export.ExportedProgram
-    input_spec: torch.export.graph_signature.InputSpec
+    input_spec: TypingInputSpec
     node: Node
     ir_type: IrType
     mutable_producer_node_name: Optional[str] = None
@@ -602,7 +623,7 @@ class FxImporter:
         node_importer.return_node_values(loc, user_outputs)
         self.symbol_table.insert(func_op)
 
-    def import_frozen_program(self, prog: torch.export.ExportedProgram):
+    def import_frozen_program(self, prog: torch.export.ExportedProgram, func_name: str = "main"):
         """Imports a consolidated torch.export.ExportedProgram instance.
 
         If using the new torch.export path (vs a lower level precursor), then this is
@@ -681,7 +702,7 @@ class FxImporter:
                 node.replace_all_uses_with(replacement)
                 g.erase_node(node)
 
-        self.import_stateless_graph(g)
+        self.import_stateless_graph(g, func_name)
 
     def import_graph_module(self, gm: GraphModule):
         """Low-level import of a GraphModule assuming that it has been functionalized.
