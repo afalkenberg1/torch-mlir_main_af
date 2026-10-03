@@ -29,6 +29,7 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/Support/ErrorHandling.h"
+#include <mlir/IR/BuiltinAttributes.h>
 
 using namespace mlir;
 using namespace mlir::torch;
@@ -60,7 +61,7 @@ namespace mlir::torch {
 // "aten.foo -> linalg.foo".
 
 static TypedAttr getNumericLimit(PatternRewriter &rewriter, Type elementType,
-                                 bool getMin = true) {
+                                 bool allowNonFinites, bool getMin = true) {
   auto bitWidth = elementType.getIntOrFloatBitWidth();
   if (llvm::isa<mlir::IntegerType>(elementType)) {
     if (getMin) {
@@ -73,8 +74,7 @@ static TypedAttr getNumericLimit(PatternRewriter &rewriter, Type elementType,
   } else if (mlir::FloatType floatType =
                  llvm::dyn_cast<mlir::FloatType>(elementType)) {
     return rewriter.getFloatAttr(
-        elementType,
-        APFloat::getLargest(floatType.getFloatSemantics(), getMin));
+        elementType, getFloatInf(floatType, getMin, allowNonFinites));
   } else {
     llvm_unreachable("Only float/integer types are supported!");
   }
@@ -1230,8 +1230,18 @@ public:
 namespace {
 class ConvertAtenScatterReduceTwoOp
     : public OpConversionPattern<AtenScatterReduceTwoOp> {
+
+private:
+  bool allowNonFinites;
+
 public:
   using OpConversionPattern::OpConversionPattern;
+
+  ConvertAtenScatterReduceTwoOp(TypeConverter &typeConverter,
+                                MLIRContext *context, bool allowNonFinites)
+      : OpConversionPattern<AtenScatterReduceTwoOp>(typeConverter, context),
+        allowNonFinites(allowNonFinites) {}
+
   LogicalResult
   matchAndRewrite(AtenScatterReduceTwoOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -1322,12 +1332,14 @@ public:
         // Set the values in the input tensor to the smallest element of that
         // type
         TypedAttr minAttr = getNumericLimit(rewriter, srcType.getElementType(),
+                                            this->allowNonFinites,
                                             /*getMin=*/true);
         normalizationValue = arith::ConstantOp::create(rewriter, loc, minAttr);
       } else if (reduceEnum == torch_upstream::ReductionType::MIN) {
         // Set the values in the input tensor to the largest element of that
         // type
         TypedAttr maxAttr = getNumericLimit(rewriter, srcType.getElementType(),
+                                            this->allowNonFinites,
                                             /*getMin=*/false);
         normalizationValue = arith::ConstantOp::create(rewriter, loc, maxAttr);
       }
@@ -1719,8 +1731,8 @@ public:
     int64_t rank = queryTy.getRank();
 
     int64_t qNumHeads = queryTy.getDimSize(rank - 3);
-    int64_t kNumHeads = valueTy.getDimSize(rank - 3);
-    int64_t vNumHeads = keyTy.getDimSize(rank - 3);
+    int64_t vNumHeads = valueTy.getDimSize(rank - 3);
+    int64_t kNumHeads = keyTy.getDimSize(rank - 3);
 
     if (llvm::any_of(llvm::ArrayRef<int64_t>{qNumHeads, kNumHeads, vNumHeads},
                      [](int64_t d) { return d == Torch::kUnknownSize; })) {
@@ -1738,17 +1750,32 @@ public:
     int64_t repeatValueShape = qNumHeads / vNumHeads;
 
     Location loc = op.getLoc();
+
+    // Build result types from key/value types with the head dim changed to
+    // qNumHeads. Using the query type as resType is incorrect because the
+    // query and key/value may differ in non-head dimensions (e.g. sequence
+    // length).
+    auto keyBaseTy = cast<BaseTensorType>(op.getKey().getType());
+    SmallVector<int64_t> keyResShape(keyBaseTy.getSizes());
+    keyResShape[rank - 3] = qNumHeads;
+    Type keyResType = rewriter.getType<ValueTensorType>(
+        keyResShape, keyBaseTy.getOptionalDtype());
+
+    auto valueBaseTy = cast<BaseTensorType>(op.getValue().getType());
+    SmallVector<int64_t> valueResShape(valueBaseTy.getSizes());
+    valueResShape[rank - 3] = qNumHeads;
+    Type valueResType = rewriter.getType<ValueTensorType>(
+        valueResShape, valueBaseTy.getOptionalDtype());
+
     FailureOr<Value> keyRepeated = repeatTensorElementsForDim(
-        op.getOperation(), rewriter, /*resType=*/op.getQuery().getType(),
-        op.getKey(),
+        op.getOperation(), rewriter, /*resType=*/keyResType, op.getKey(),
         /*repeats=*/repeatKeyShape, /*dim=*/rank - 3);
     if (failed(keyRepeated))
       return rewriter.notifyMatchFailure(
           loc, "Failed to repeat the tensor elements for key.");
 
     FailureOr<Value> valueRepeated = repeatTensorElementsForDim(
-        op.getOperation(), rewriter, /*resType=*/op.getQuery().getType(),
-        op.getValue(),
+        op.getOperation(), rewriter, /*resType=*/valueResType, op.getValue(),
         /*repeats=*/repeatValueShape, /*dim=*/rank - 3);
     if (failed(valueRepeated))
       return rewriter.notifyMatchFailure(
@@ -1844,72 +1871,77 @@ public:
       mask = genericOp.getResult(0);
     }
 
-    // Broadcast the batch dimensions of the mask:
+    // Broadcast the mask to the expected attention-mask shape:
+    // [..., query_seq_len, key_seq_len].
     if (!isa<Torch::NoneType>(mask.getType())) {
       auto maskTy = cast<RankedTensorType>(mask.getType());
       int64_t rank = maskTy.getRank();
+      // Target mask shape: [..., query_seq_len, key_seq_len].
+      SmallVector<int64_t> targetMaskShape(rank);
+      SmallVector<Value> targetMaskDynDimValues(rank);
+      for (int64_t i = 0; i < rank - 2; ++i) {
+        targetMaskShape[i] = queryTy.getDimSize(i);
+        if (targetMaskShape[i] == ShapedType::kDynamic)
+          targetMaskDynDimValues[i] =
+              tensor::DimOp::create(rewriter, loc, query, i);
+      }
+
+      targetMaskShape[rank - 2] = queryTy.getDimSize(queryTy.getRank() - 2);
+      if (targetMaskShape[rank - 2] == ShapedType::kDynamic)
+        targetMaskDynDimValues[rank - 2] =
+            tensor::DimOp::create(rewriter, loc, query, queryTy.getRank() - 2);
+
+      targetMaskShape[rank - 1] = keyTy.getDimSize(keyTy.getRank() - 2);
+      if (targetMaskShape[rank - 1] == ShapedType::kDynamic)
+        targetMaskDynDimValues[rank - 1] =
+            tensor::DimOp::create(rewriter, loc, key, keyTy.getRank() - 2);
+
       bool needsBroadcast = false;
-      for (int i = 0, s = rank - 2; i < s; ++i) {
-        needsBroadcast |= maskTy.getDimSize(i) != queryTy.getDimSize(i);
+      for (int64_t i = 0; i < rank; ++i) {
+        needsBroadcast |= maskTy.getDimSize(i) != targetMaskShape[i];
       }
 
       if (needsBroadcast) {
-        SmallVector<int64_t> maskShape;
         SmallVector<Value> maskDynDims;
-
         SmallVector<AffineExpr> maskExprs;
-        for (int i = 0, s = rank - 2; i < s; ++i) {
-          maskShape.push_back(queryTy.getDimSize(i));
-
-          if (maskTy.getDimSize(i) != queryTy.getDimSize(i)) {
-            maskExprs.push_back(rewriter.getAffineConstantExpr(0));
-          } else {
-            maskExprs.push_back(rewriter.getAffineDimExpr(i));
-          }
-
-          if (queryTy.isDynamicDim(i)) {
-            maskDynDims.push_back(
-                tensor::DimOp::create(rewriter, loc, query, i));
-          }
+        for (int64_t i = 0; i < rank; ++i) {
+          bool broadcastDim = maskTy.getDimSize(i) != targetMaskShape[i];
+          maskExprs.push_back(broadcastDim ? rewriter.getAffineConstantExpr(0)
+                                           : rewriter.getAffineDimExpr(i));
+          if (targetMaskShape[i] == ShapedType::kDynamic)
+            maskDynDims.push_back(targetMaskDynDimValues[i]);
         }
-
-        maskExprs.push_back(rewriter.getAffineDimExpr(rank - 2));
-        maskExprs.push_back(rewriter.getAffineDimExpr(rank - 1));
-        maskShape.push_back(maskTy.getDimSize(rank - 2));
-        maskShape.push_back(maskTy.getDimSize(rank - 1));
-        if (maskTy.isDynamicDim(rank - 2))
-          maskDynDims.push_back(
-              tensor::DimOp::create(rewriter, loc, mask, rank - 2));
-        if (maskTy.isDynamicDim(rank - 1))
-          maskDynDims.push_back(
-              tensor::DimOp::create(rewriter, loc, mask, rank - 1));
 
         SmallVector<AffineMap> affineMaps = {
             AffineMap::get(/*dimCount=*/rank, /*symbolCount=*/0, maskExprs,
                            op.getContext()),
             rewriter.getMultiDimIdentityMap(rank)};
-        SmallVector<utils::IteratorType> findMaxIteratorTypes(
+        SmallVector<utils::IteratorType> iteratorTypes(
             rank, utils::IteratorType::parallel);
 
-        Value emptyMask = tensor::EmptyOp::create(
-            rewriter, loc, maskShape, maskTy.getElementType(), maskDynDims);
-        Value newMask =
-            linalg::GenericOp::create(
-                rewriter, loc, emptyMask.getType(), mask,
-                ValueRange({emptyMask}), affineMaps, findMaxIteratorTypes,
-                [&](OpBuilder &b, Location loc, ValueRange args) {
-                  linalg::YieldOp::create(b, loc, args[0]);
-                })
-                .getResult(0);
+        Value emptyMask =
+            tensor::EmptyOp::create(rewriter, loc, targetMaskShape,
+                                    maskTy.getElementType(), maskDynDims);
+        Value newMask = linalg::GenericOp::create(
+                            rewriter, loc, emptyMask.getType(), mask,
+                            ValueRange({emptyMask}), affineMaps, iteratorTypes,
+                            [&](OpBuilder &b, Location loc, ValueRange args) {
+                              linalg::YieldOp::create(b, loc, args[0]);
+                            })
+                            .getResult(0);
         mask = newMask;
       }
     }
 
+    // Verify the scale matches the expected 1/sqrt(headDim).
+    // See:
+    // https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+    mlir::FloatAttr scaleAttr{};
     if (!isa<Torch::NoneType>(scale.getType())) {
       double scaleFloat;
-      if (!matchPattern(scale, m_TorchConstantFloat(&scaleFloat)) ||
-          scaleFloat != 1.0)
-        return rewriter.notifyMatchFailure(loc, "only default scale supported");
+      if (!matchPattern(scale, m_TorchConstantFloat(&scaleFloat)))
+        return rewriter.notifyMatchFailure(loc, "scale must be a constant");
+      scaleAttr = rewriter.getF64FloatAttr(scaleFloat);
     }
 
     if (queryTy.getRank() != valueTy.getRank() ||
@@ -1990,7 +2022,7 @@ public:
 
     // Overwrite with tm_tensor::attention
     Value attention = AttentionOp::create(rewriter, loc, outType, inputs,
-                                          SmallVector<Value>{output})
+                                          SmallVector<Value>{output}, scaleAttr)
                           .getResult()[0];
 
     if (opTy != outType) {
@@ -2007,8 +2039,19 @@ public:
 
 namespace {
 class ConvertAtenKthvalueOp : public OpConversionPattern<AtenKthvalueOp> {
+
+private:
+  bool allowNonFinites;
+
 public:
   using OpConversionPattern::OpConversionPattern;
+
+public:
+  ConvertAtenKthvalueOp(TypeConverter &typeConverter, MLIRContext *context,
+                        bool allowNonFinites)
+      : OpConversionPattern<AtenKthvalueOp>(typeConverter, context),
+        allowNonFinites(allowNonFinites) {}
+
   LogicalResult
   matchAndRewrite(AtenKthvalueOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -2080,17 +2123,15 @@ public:
           rewriter, loc,
           rewriter.getFloatAttr(
               inputElementType,
-              APFloat::getInf(
-                  cast<mlir::FloatType>(inputElementType).getFloatSemantics(),
-                  /*Negative=*/false)));
+              getFloatInf(cast<mlir::FloatType>(inputElementType),
+                          /*Negative=*/false, this->allowNonFinites)));
       // min float for linalg generic op tensor
       fillValLinalgFindMax = arith::ConstantOp::create(
           rewriter, loc,
           rewriter.getFloatAttr(
               inputElementType,
-              APFloat::getInf(
-                  cast<mlir::FloatType>(inputElementType).getFloatSemantics(),
-                  /*Negative=*/true)));
+              getFloatInf(cast<mlir::FloatType>(inputElementType),
+                          /*Negative=*/true, this->allowNonFinites)));
     } else if (!isUnsigned) {
       auto width = cast<mlir::IntegerType>(inputElementType).getWidth();
       // max signed int for topk op tensor
@@ -2139,7 +2180,8 @@ public:
     // It is equal to the max 32-bit signless integer.
     auto signlessType = mlir::IntegerType::get(op.getContext(), 32,
                                                mlir::IntegerType::Signless);
-    auto initIdx = getNumericLimit(rewriter, signlessType, /*getMin=*/false);
+    auto initIdx = getNumericLimit(rewriter, signlessType,
+                                   this->allowNonFinites, /*getMin=*/false);
     auto fillValTopkIdx = arith::ConstantOp::create(rewriter, loc, initIdx);
     // Fill the initial topk op output indices tensor.
     Value topkOutputIdx =
@@ -2223,7 +2265,8 @@ public:
         {findMaxMapExprs, findMaxMapResultExprs, findMaxMapResultExprs},
         rewriter.getContext());
 
-    // Create linalg op for finding the max value in the extracted topk values.
+    // Create linalg op for finding the max value in the extracted topk
+    // values.
     auto findMaxLinalg = linalg::GenericOp::create(
         rewriter, loc,
         ArrayRef<Type>(
@@ -2360,8 +2403,8 @@ public:
     auto castedIdxMaps = AffineMap::inferFromExprList(
         {castedIdxMapExprs, castedIdxMapExprs}, rewriter.getContext());
 
-    // Linalg generic op for casting topk idx output tensor elements from i32 to
-    // result idx tensor element type.
+    // Linalg generic op for casting topk idx output tensor elements from i32
+    // to result idx tensor element type.
     auto castedIdxLinalg = linalg::GenericOp::create(
         rewriter, loc, ArrayRef<Type>({filledTensorCastedIdx.getType()}),
         extractedIdx, filledTensorCastedIdx, castedIdxMaps,
@@ -2397,7 +2440,8 @@ public:
         resultShapeInt, findMaxIdxType.getElementType());
 
     if (!keepDim) {
-      // If keepdim=false, cast the the outputs to appropriate type and return.
+      // If keepdim=false, cast the the outputs to appropriate type and
+      // return.
       Value retVal =
           tensor::CastOp::create(rewriter, loc, squeezedValType, findMaxVal);
       Value retIdx =
@@ -2467,6 +2511,9 @@ namespace {
 class ConvertTorchToTMTensor
     : public impl::ConvertTorchToTMTensorBase<ConvertTorchToTMTensor> {
 public:
+  using impl::ConvertTorchToTMTensorBase<
+      ConvertTorchToTMTensor>::ConvertTorchToTMTensorBase;
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<linalg::LinalgDialect>();
     registry.insert<func::FuncDialect>();
@@ -2497,7 +2544,8 @@ public:
     patterns.add<ConvertAtenMaxPool2dWithIndicesBackwardOp>(typeConverter,
                                                             context);
     target.addIllegalOp<AtenScatterReduceTwoOp>();
-    patterns.add<ConvertAtenScatterReduceTwoOp>(typeConverter, context);
+    patterns.add<ConvertAtenScatterReduceTwoOp>(typeConverter, context,
+                                                this->allowNonFinites);
     target.addIllegalOp<AtenSortOp>();
     patterns.add<ConvertAtenSortOp>(typeConverter, context);
     target.addIllegalOp<AtenCumsumOp>();
@@ -2515,7 +2563,8 @@ public:
     patterns.add<ConvertAtenScatterOp<AtenScatterAddOp>>(typeConverter,
                                                          context);
     target.addIllegalOp<AtenKthvalueOp>();
-    patterns.add<ConvertAtenKthvalueOp>(typeConverter, context);
+    patterns.add<ConvertAtenKthvalueOp>(typeConverter, context,
+                                        this->allowNonFinites);
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
@@ -2527,6 +2576,13 @@ public:
 std::unique_ptr<OperationPass<func::FuncOp>>
 createConvertTorchToTMTensorPass() {
   return std::make_unique<ConvertTorchToTMTensor>();
+}
+
+std::unique_ptr<OperationPass<func::FuncOp>>
+createConvertTorchToTMTensorPass(bool allowNonFinites) {
+  ConvertTorchToTMTensorOptions options;
+  options.allowNonFinites = allowNonFinites;
+  return std::make_unique<ConvertTorchToTMTensor>(options);
 }
 
 } // namespace mlir::torch

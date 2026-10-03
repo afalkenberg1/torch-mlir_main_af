@@ -116,6 +116,38 @@ def test_import_frozen_exported_program_with_dynamic_shapes():
 
 
 @run
+# CHECK-LABEL: test_dynamic_shape_symfloat_mul_uses_scalar_overload
+# CHECK:     func.func @test_net(%[[ARG0:[a-zA-Z0-9]+]]: !torch.vtensor<[?,10],f32>) -> !torch.vtensor<[?,10],f32>
+# CHECK:     torch.aten.mul.Scalar {{.*}} : !torch.vtensor<[?,10],f32>, !torch.float -> !torch.vtensor<[?,10],f32>
+def test_dynamic_shape_symfloat_mul_uses_scalar_overload():
+    class Basic(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, x):
+            # When exported with dynamic_shapes, n will be a symbolic int, and
+            # the right hand side of the multiplication will be a symbolic float.
+            n = x.shape[0]
+            return x * (n / (n - 1))
+
+    # Sample input
+    x = torch.randn(8, 10)
+
+    dim_0 = Dim("dim_0", min=2, max=64)
+    dynamic_shapes = {"x": {0: dim_0}}
+
+    m = fx.export_and_import(
+        Basic(),
+        x,
+        dynamic_shapes=dynamic_shapes,
+        func_name="test_net",
+        strict=True,
+    )
+    print(m)
+    m.operation.verify()
+
+
+@run
 # CHECK-LABEL: test_broadcast_with_dynamic_shapes
 # CHECK:     func.func @test_net(%[[ARG0:[a-zA-Z0-9]+]]: !torch.vtensor<[1,2],f32>, %[[ARG1:[a-zA-Z0-9]+]]: !torch.vtensor<[?],f32>) -> !torch.vtensor<[?,2],f32>
 # CHECK:     %[[S0:.*]] = torch.symbolic_int "{{[a-z0-9]+}}" {min_val = {{[0-9]+}}, max_val = {{[0-9]+}}} : !torch.int
@@ -181,7 +213,8 @@ def test_stateless_fx_import():
 
 @run
 # CHECK-LABEL: test_full
-# CHECK:    %2 = torch.aten.fill.Scalar %1, %int0 : !torch.vtensor<[],i1>, !torch.int -> !torch.vtensor<[],i1>
+# CHECK:    %[[LIT:.*]] = torch.vtensor.literal(dense<false> : tensor<i1>) : !torch.vtensor<[],i1>
+# CHECK:    return %[[LIT]] : !torch.vtensor<[],i1>
 def test_full():
     class Basic(nn.Module):
         def __init__(self):
@@ -204,6 +237,40 @@ def test_full():
         "torch-simplification-pipeline",
     )
     print(m)
+
+
+@run
+# CHECK-LABEL: test_uint32_tensor_literal
+# CHECK: func.func @uint32_tensor_literal() -> !torch.vtensor<[2],ui32>
+# CHECK: torch.vtensor.literal
+# CHECK-SAME: tensor<2xui32>
+# CHECK-SAME: !torch.vtensor<[2],ui32>
+def test_uint32_tensor_literal():
+    class Module(torch.nn.Module):
+        def forward(self):
+            return torch.tensor([1, 2], dtype=torch.uint32)
+
+    module = fx.export_and_import(Module(), func_name="uint32_tensor_literal")
+    print(module)
+
+
+@run
+# CHECK-LABEL: test_view_uint32
+# CHECK: func.func @view_uint32(%[[ARG:.+]]: !torch.vtensor<[8],f32>)
+# CHECK-SAME: -> !torch.vtensor<[8],ui32>
+# CHECK: %[[DTYPE:.+]] = torch.constant.int 28
+# CHECK: torch.aten.view.dtype %[[ARG]], %[[DTYPE]]
+# CHECK-SAME: !torch.vtensor<[8],f32>, !torch.int
+# CHECK-SAME: -> !torch.vtensor<[8],ui32>
+def test_view_uint32():
+    class Module(torch.nn.Module):
+        def forward(self, value):
+            return value.view(torch.uint32)
+
+    module = fx.export_and_import(
+        Module(), torch.ones(8, dtype=torch.float32), func_name="view_uint32"
+    )
+    print(module)
 
 
 @run
@@ -252,6 +319,159 @@ def test_while_loop_two_returns():
 
 
 @run
+# CHECK-LABEL: test_flex_attention
+# Check that helper functions are emitted first.
+# CHECK: func.func private @sdpa_score0(%arg0: !torch.vtensor<[],f32>, %arg1: !torch.vtensor<[],si32>, %arg2: !torch.vtensor<[],si32>, %arg3: !torch.vtensor<[],si32>, %arg4: !torch.vtensor<[],si32>) -> !torch.vtensor<[],f32>
+# CHECK: torch.aten.tanh
+# CHECK: func.func private @sdpa_mask0(%arg0: !torch.vtensor<[],si32>, %arg1: !torch.vtensor<[],si32>, %arg2: !torch.vtensor<[],si32>, %arg3: !torch.vtensor<[],si32>) -> !torch.vtensor<[],i1>
+# CHECK: torch.aten.full_like
+# Then check the main function.
+# CHECK: func.func @test_flex_attention(%arg0: !torch.vtensor<[4,8,1024,64],f32>, %arg1: !torch.vtensor<[4,8,1024,64],f32>, %arg2: !torch.vtensor<[4,8,1024,64],f32>)
+# CHECK-SAME: -> !torch.vtensor<[4,8,1024,64],f32>
+# Validate flex_attention op with 3 results and 6 operands:
+# CHECK: %[[SCALE:.*]] = torch.constant.float 1.000000e+00
+# CHECK: %[[RETURN_LSE:.*]] = torch.constant.bool false
+# CHECK: %[[RETURN_MAX:.*]] = torch.constant.bool false
+# CHECK: %[[OUTPUT:.*]], %[[LOGSUMEXP:.*]], %[[MAX_SCORES:.*]] = torch.hop_flex_attention %arg0, %arg1, %arg2, %[[SCALE]], %[[RETURN_LSE]], %[[RETURN_MAX]] {mask_mod_fn = @sdpa_mask0, score_mod_fn = @sdpa_score0}
+# CHECK-SAME: : !torch.vtensor<[4,8,1024,64],f32>, !torch.vtensor<[4,8,1024,64],f32>, !torch.vtensor<[4,8,1024,64],f32>, !torch.float, !torch.bool, !torch.bool
+# CHECK-SAME: -> !torch.vtensor<[4,8,1024,64],f32>, !torch.vtensor<[4,8,1024],f32>, !torch.vtensor<[4,8,1024],f32>
+# CHECK: return %[[OUTPUT]]
+def test_flex_attention():
+    from torch._subclasses.fake_tensor import FakeTensor
+    from torch.nn.attention.flex_attention import (
+        BlockMask,
+        _LARGE_SPARSE_BLOCK_SIZE,
+        flex_attention,
+    )
+    from torch import Tensor
+
+    def _create_empty_block_mask(query: Tensor, key: Tensor):
+        # Default block mask for flex attention.
+        device = query.device
+        return BlockMask.from_kv_blocks(
+            kv_num_blocks=torch.ones([1, 1, 1], dtype=torch.int32, device=device),
+            kv_indices=torch.zeros([1, 1, 1, 1], dtype=torch.int32, device=device),
+            BLOCK_SIZE=_LARGE_SPARSE_BLOCK_SIZE,
+            seq_lengths=(1, 1),
+        )
+
+    def relative_position_bias(
+        score: Tensor,
+        batch: Tensor,
+        head: Tensor,
+        token_q: Tensor,
+        token_kv: Tensor,
+    ) -> Tensor:
+        # Simple score mod function.
+        return torch.tanh(score)
+
+    class FlexAttention(torch.nn.Module):
+        def __init__(self, block_mask):
+            super().__init__()
+            self.block_mask = block_mask
+
+        def forward(self, q, k, v):
+            output = flex_attention(
+                q,
+                k,
+                v,
+                score_mod=relative_position_bias,
+                block_mask=self.block_mask,
+                scale=1.0,
+                kernel_options={},
+            )
+            # flex_attention returns a single output tensor.
+            assert isinstance(output, FakeTensor)
+            return output
+
+    # Export -> import to Torch-MLIR
+    B, Hq, Hkv, L, S, E, Ev = 4, 8, 8, 1024, 1024, 64, 64
+    q = torch.ones(B, Hq, L, E)
+    k = torch.ones(B, Hkv, S, E)
+    v = torch.ones(B, Hkv, S, Ev)
+    m = fx.export_and_import(
+        FlexAttention(_create_empty_block_mask(q, k)),
+        q,
+        k,
+        v,
+        func_name="test_flex_attention",
+    )
+    print(m)
+
+
+@run
+# CHECK-LABEL: test_flex_attention_noblock_return_lse
+# Check that helper functions are emitted first.
+# CHECK: func.func private @sdpa_score0(%arg0: !torch.vtensor<[],f32>, %arg1: !torch.vtensor<[],si32>, %arg2: !torch.vtensor<[],si32>, %arg3: !torch.vtensor<[],si32>, %arg4: !torch.vtensor<[],si32>) -> !torch.vtensor<[],f32>
+# CHECK: torch.aten.tanh
+# Note how the mask function is automatically generated and not provided.
+# CHECK: func.func private @sdpa_mask0(%arg0: !torch.vtensor<[],si32>, %arg1: !torch.vtensor<[],si32>, %arg2: !torch.vtensor<[],si32>, %arg3: !torch.vtensor<[],si32>) -> !torch.vtensor<[],i1>
+# CHECK: torch.aten.full_like
+# Then check the main function.
+# CHECK: func.func @test_flex_attention(%arg0: !torch.vtensor<[4,8,1024,64],f32>, %arg1: !torch.vtensor<[4,8,1024,64],f32>, %arg2: !torch.vtensor<[4,8,1024,64],f32>)
+# CHECK-SAME: -> !torch.vtensor<[4,8,1024,64],f32>
+# Validate flex_attention op with 3 results and 6 operands:
+# CHECK: %[[SCALE:.*]] = torch.constant.float 1.000000e+00
+# CHECK: %[[RETURN_LSE:.*]] = torch.constant.bool true
+# CHECK: %[[RETURN_MAX:.*]] = torch.constant.bool false
+# CHECK: %[[OUTPUT:.*]], %[[LOGSUMEXP:.*]], %[[MAX_SCORES:.*]] = torch.hop_flex_attention %arg0, %arg1, %arg2, %[[SCALE]], %[[RETURN_LSE]], %[[RETURN_MAX]] {mask_mod_fn = @sdpa_mask0, score_mod_fn = @sdpa_score0}
+# CHECK-SAME: : !torch.vtensor<[4,8,1024,64],f32>, !torch.vtensor<[4,8,1024,64],f32>, !torch.vtensor<[4,8,1024,64],f32>, !torch.float, !torch.bool, !torch.bool
+# CHECK-SAME: -> !torch.vtensor<[4,8,1024,64],f32>, !torch.vtensor<[4,8,1024],f32>, !torch.vtensor<[4,8,1024],f32>
+# CHECK: return %[[OUTPUT]]
+def test_flex_attention_noblock_return_lse():
+    # from torch._higher_order_ops.flex_attention import (
+    #     flex_attention as flex_attention_hop,
+    # )
+    from torch.nn.attention.flex_attention import flex_attention, AuxRequest, AuxOutput
+    from torch import Tensor
+
+    def relative_position_bias(
+        score: Tensor,
+        batch: Tensor,
+        head: Tensor,
+        token_q: Tensor,
+        token_kv: Tensor,
+    ) -> Tensor:
+        # Simple score mod function.
+        return torch.tanh(score)
+
+    class FlexAttention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, q, k, v):
+            outputs = flex_attention(
+                q,
+                k,
+                v,
+                score_mod=relative_position_bias,
+                block_mask=None,
+                scale=1.0,
+                return_aux=AuxRequest(lse=True),
+                kernel_options={},
+            )
+            # Note: Returning max scores is not supported on CPU, and will raise a
+            # NotImplementedError if max_scores is specified in the AuxRequest input.
+            assert isinstance(outputs[1], AuxOutput) and outputs[1].max_scores == None
+            return outputs[0]
+
+    # Export -> import to Torch-MLIR
+    B, Hq, Hkv, L, S, E, Ev = 4, 8, 8, 1024, 1024, 64, 64
+    q = torch.ones(B, Hq, L, E)
+    k = torch.ones(B, Hkv, S, E)
+    v = torch.ones(B, Hkv, S, Ev)
+    m = fx.export_and_import(
+        FlexAttention(),
+        q,
+        k,
+        v,
+        func_name="test_flex_attention",
+    )
+
+    print(m)
+
+
+@run
 # CHECK-LABEL: test_stack_trace
 # CHECK: #loc[[LOC1:.+]] = loc(
 # CHECK: %{{.+}} = torch.aten.add.Tensor {{.+}} loc(#loc[[LOC1]])
@@ -275,3 +495,29 @@ def test_stack_trace():
     m = fx.export_and_import(Basic(), x, y, func_name="test_stack_trace")
     mlir_asm = m.operation.get_asm(enable_debug_info=True)
     print(mlir_asm)
+
+
+@run
+# Asserting a single input argument here, since the frozen program should have
+# its BatchNorm buffers lifted from function arguments to inlined constants.
+# 2 BatchNorm layers × 4 float tensors each: weight, bias, running_mean,
+# running_var. This gives 8 expected function arguments.
+# CHECK-LABEL: test_import_frozen_exported_program_with_multiple_buffers
+# CHECK: func.func @main(%[[ARG0:[a-zA-Z0-9]+]]: !torch.vtensor<[2,10,20,20],f32>)
+# CHECK-COUNT-8: = torch.vtensor.literal(dense_resource<{{.*}}> : tensor<10xf32>)
+def test_import_frozen_exported_program_with_multiple_buffers():
+    class DoubleBatchNorm(nn.Module):
+        def __init__(self, num_features):
+            super().__init__()
+            self.bn1 = nn.BatchNorm2d(num_features)
+            self.bn2 = nn.BatchNorm2d(num_features)
+
+        def forward(self, x):
+            x = self.bn1(x)
+            x = self.bn2(x)
+            return x
+
+    model = DoubleBatchNorm(10)
+    model.eval()
+    m = fx.export_and_import(model, torch.randn(2, 10, 20, 20))
+    print(m)

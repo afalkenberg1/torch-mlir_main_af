@@ -41,11 +41,20 @@ namespace {
 // if the current value exceeds the running max (min).
 template <typename OpTy>
 class ConvertAtenMinMaxDimOp : public OpConversionPattern<OpTy> {
+
+private:
+  bool allowNonFinites;
+
 public:
   using OpConversionPattern<OpTy>::OpConversionPattern;
   using OpConversionPattern<OpTy>::getTypeConverter;
 
   using OpAdaptor = typename OpTy::Adaptor;
+
+  ConvertAtenMinMaxDimOp(TypeConverter &typeConverter, MLIRContext *context,
+                         bool allowNonFinites)
+      : OpConversionPattern<OpTy>(typeConverter, context),
+        allowNonFinites(allowNonFinites) {}
 
   LogicalResult
   matchAndRewrite(OpTy op, OpAdaptor adaptor,
@@ -83,12 +92,12 @@ public:
       return rewriter.notifyMatchFailure(op, "dim is not a valid dim");
 
     Type inElementType = inputType.getElementType();
-    bool isUnsigned = false;
+    bool useUnsigned = false;
     if (!isa<mlir::FloatType>(inElementType)) {
       if (isa<mlir::IntegerType>(inElementType)) {
-        auto integerTy = dyn_cast<mlir::IntegerType>(
+        auto torchIntTy = dyn_cast<mlir::IntegerType>(
             cast<BaseTensorType>(op.getSelf().getType()).getDtype());
-        isUnsigned = integerTy.isUnsigned();
+        useUnsigned = useUnsignedIntegerSemantics(torchIntTy);
       } else {
         return rewriter.notifyMatchFailure(
             op, opName + " to linalg.* requires Float or Integer "
@@ -118,18 +127,17 @@ public:
           rewriter, loc,
           rewriter.getFloatAttr(
               inElementType,
-              APFloat::getInf(
-                  cast<mlir::FloatType>(inElementType).getFloatSemantics(),
-                  /*Negative=*/isMax)));
-    } else if (!isUnsigned) {
+              getFloatInf(cast<mlir::FloatType>(inElementType),
+                          /*Negative=*/isMax, this->allowNonFinites)));
+    } else {
       auto width = cast<mlir::IntegerType>(inElementType).getWidth();
-      auto init = isMax ? APSInt::getSignedMinValue(width)
-                        : APSInt::getSignedMaxValue(width);
-      fillValue = arith::ConstantOp::create(
-          rewriter, loc, rewriter.getIntegerAttr(inElementType, init));
-    } else if (isUnsigned) {
-      auto width = cast<mlir::IntegerType>(inElementType).getWidth();
-      auto init = isMax ? APInt::getMinValue(width) : APInt::getMaxValue(width);
+      APInt init;
+      if (useUnsigned) {
+        init = isMax ? APInt::getMinValue(width) : APInt::getMaxValue(width);
+      } else {
+        init = isMax ? APSInt::getSignedMinValue(width)
+                     : APSInt::getSignedMaxValue(width);
+      }
       fillValue = arith::ConstantOp::create(
           rewriter, loc, rewriter.getIntegerAttr(inElementType, init));
     }
@@ -190,9 +198,9 @@ public:
           } else {
             arith::CmpIPredicate predType;
             if (isMax) {
-              predType = isUnsigned ? arith::CmpIPredicate::ugt
-                                    : arith::CmpIPredicate::sgt;
-              if (isUnsigned) {
+              predType = useUnsigned ? arith::CmpIPredicate::ugt
+                                     : arith::CmpIPredicate::sgt;
+              if (useUnsigned) {
                 resultVal = arith::MaxUIOp::create(rewriter, nestedLoc,
                                                    newValue, oldValue);
               } else {
@@ -200,9 +208,9 @@ public:
                                                    newValue, oldValue);
               }
             } else {
-              predType = isUnsigned ? arith::CmpIPredicate::ult
-                                    : arith::CmpIPredicate::slt;
-              if (isUnsigned) {
+              predType = useUnsigned ? arith::CmpIPredicate::ult
+                                     : arith::CmpIPredicate::slt;
+              if (useUnsigned) {
                 resultVal = arith::MinUIOp::create(rewriter, nestedLoc,
                                                    newValue, oldValue);
               } else {
@@ -288,11 +296,12 @@ static Value createAbsOpForNormOps(OpBuilder &b, Location loc, Value elem,
 }
 
 static Value createInitElementForReduceOp(OpBuilder &b, Location loc,
-                                          Operation *op, Type elementType) {
+                                          Operation *op, Type elementType,
+                                          bool allowNonFinites) {
   if (isa<AtenSumOp, AtenSumDimIntListOp>(op))
     return arith::ConstantOp::create(b, loc, b.getZeroAttr(elementType));
 
-  if (isa<AtenProdOp, AtenProdDimIntOp>(op)) {
+  if (isa<AtenProdOp, AtenProdDimIntOp, PrimsProdOp>(op)) {
     if (isa<mlir::FloatType>(elementType))
       return arith::ConstantOp::create(b, loc,
                                        b.getFloatAttr(elementType, 1.0));
@@ -305,36 +314,38 @@ static Value createInitElementForReduceOp(OpBuilder &b, Location loc,
     if (isa<mlir::FloatType>(elementType))
       return arith::ConstantOp::create(
           b, loc,
-          b.getFloatAttr(
-              elementType,
-              APFloat::getInf(
-                  cast<mlir::FloatType>(elementType).getFloatSemantics(),
-                  /*Negative=*/true)));
+          b.getFloatAttr(elementType,
+                         getFloatInf(cast<mlir::FloatType>(elementType),
+                                     /*Negative=*/true, allowNonFinites)));
     else if (isa<mlir::IntegerType>(elementType) &&
-             elementType.getIntOrFloatBitWidth() != 8)
-      return arith::ConstantOp::create(
-          b, loc,
-          b.getIntegerAttr(
-              elementType,
-              APSInt::getSignedMinValue(elementType.getIntOrFloatBitWidth())));
+             elementType.getIntOrFloatBitWidth() != 8) {
+      unsigned width = elementType.getIntOrFloatBitWidth();
+      auto init =
+          useUnsignedIntegerSemantics(cast<mlir::IntegerType>(elementType))
+              ? APInt::getMinValue(width)
+              : APSInt::getSignedMinValue(width);
+      return arith::ConstantOp::create(b, loc,
+                                       b.getIntegerAttr(elementType, init));
+    }
   }
 
   if (isa<AtenMinOp>(op)) {
     if (isa<mlir::FloatType>(elementType))
       return arith::ConstantOp::create(
           b, loc,
-          b.getFloatAttr(
-              elementType,
-              APFloat::getInf(
-                  cast<mlir::FloatType>(elementType).getFloatSemantics(),
-                  /*Negative=*/false)));
+          b.getFloatAttr(elementType,
+                         getFloatInf(cast<mlir::FloatType>(elementType),
+                                     /*Negative=*/false, allowNonFinites)));
     else if (isa<mlir::IntegerType>(elementType) &&
-             elementType.getIntOrFloatBitWidth() != 8)
-      return arith::ConstantOp::create(
-          b, loc,
-          b.getIntegerAttr(
-              elementType,
-              APSInt::getSignedMaxValue(elementType.getIntOrFloatBitWidth())));
+             elementType.getIntOrFloatBitWidth() != 8) {
+      unsigned width = elementType.getIntOrFloatBitWidth();
+      auto init =
+          useUnsignedIntegerSemantics(cast<mlir::IntegerType>(elementType))
+              ? APInt::getMaxValue(width)
+              : APSInt::getSignedMaxValue(width);
+      return arith::ConstantOp::create(b, loc,
+                                       b.getIntegerAttr(elementType, init));
+    }
   }
 
   if (isa<AtenLinalgVectorNormOp>(op) || isa<AtenFrobeniusNormDimOp>(op) ||
@@ -345,7 +356,7 @@ static Value createInitElementForReduceOp(OpBuilder &b, Location loc,
     return arith::ConstantOp::create(b, loc, b.getBoolAttr(true));
   }
 
-  if (isa<AtenAnyOp, AtenAnyDimsOp>(op)) {
+  if (isa<AtenAnyOp, AtenAnyDimsOp, AtenAnyDimOp>(op)) {
     return arith::ConstantOp::create(b, loc, b.getBoolAttr(false));
   }
 
@@ -366,7 +377,7 @@ static Value createLinalgPayloadForReduceOp(OpBuilder &b, Location loc,
       return arith::AddFOp::create(b, loc, self, result);
     else if (isa<mlir::IntegerType>(resultElementType))
       return arith::AddIOp::create(b, loc, self, result);
-  } else if (isa<AtenProdOp, AtenProdDimIntOp>(op)) {
+  } else if (isa<AtenProdOp, AtenProdDimIntOp, PrimsProdOp>(op)) {
     Value self =
         convertScalarToDtype(b, loc, payloadArgs[0], resultElementType);
     Value result = payloadArgs[1];
@@ -383,10 +394,9 @@ static Value createLinalgPayloadForReduceOp(OpBuilder &b, Location loc,
     else if (isa<mlir::IntegerType>(resultElementType)) {
       IntegerType intType = dyn_cast<mlir::IntegerType>(
           cast<BaseTensorType>(max.getSelf().getType()).getDtype());
-      if (intType.isUnsigned())
+      if (useUnsignedIntegerSemantics(intType))
         return arith::MaxUIOp::create(b, loc, self, result);
-      if (intType.isSigned())
-        return arith::MaxSIOp::create(b, loc, self, result);
+      return arith::MaxSIOp::create(b, loc, self, result);
     }
   } else if (auto min = dyn_cast<AtenMinOp>(op)) {
     Value self =
@@ -397,10 +407,9 @@ static Value createLinalgPayloadForReduceOp(OpBuilder &b, Location loc,
     else if (isa<mlir::IntegerType>(resultElementType)) {
       IntegerType intType = dyn_cast<mlir::IntegerType>(
           cast<BaseTensorType>(min.getSelf().getType()).getDtype());
-      if (intType.isUnsigned())
+      if (useUnsignedIntegerSemantics(intType))
         return arith::MinUIOp::create(b, loc, self, result);
-      if (intType.isSigned())
-        return arith::MinSIOp::create(b, loc, self, result);
+      return arith::MinSIOp::create(b, loc, self, result);
     }
   } else if (isa<AtenNormScalarOp>(op)) {
     // This creates payload for only the first of the two linalg.generic ops.
@@ -442,7 +451,7 @@ static Value createLinalgPayloadForReduceOp(OpBuilder &b, Location loc,
     Value result = payloadArgs[1];
     Value self = convertScalarToDtype(b, loc, elem, resultElementType);
     return arith::AndIOp::create(b, loc, self, result);
-  } else if (isa<AtenAnyOp, AtenAnyDimsOp>(op)) {
+  } else if (isa<AtenAnyOp, AtenAnyDimsOp, AtenAnyDimOp>(op)) {
     Value elem = payloadArgs[0];
     Value result = payloadArgs[1];
     Value self = convertScalarToDtype(b, loc, elem, resultElementType);
@@ -455,6 +464,8 @@ static Value createLinalgPayloadForReduceOp(OpBuilder &b, Location loc,
 namespace {
 class ConvertReductionOp : public ConversionPattern {
 private:
+  bool allowNonFinites;
+
   /// Given a reduction operation that has the `keepdim` attribute and the
   /// (optional) `dim` attribute, return the source tensor operand and the
   /// literal values of the attributes or failure otherwise.
@@ -504,6 +515,87 @@ private:
     return opInfo;
   }
 
+  /// Compute reduction info from a tensor operand and an optional Torch list
+  /// of constant ints describing the dims to reduce. `keepdim` is inferred
+  /// by comparing the rank of the op's result type to the rank of the input
+  /// tensor: if they match, the reduced dimensions are kept (size 1). Used
+  /// for ops (e.g. `prims.prod`) that lack a `keepdim` operand and use
+  /// accessor names that differ from the dim-variant template.
+  ///
+  /// In typical pytorch-imported programs, `keepdim` is always implicitly
+  /// `false` for prims ops; however, we allow intentionally diverging from
+  /// this (e.g. in ONNX or IR-emitting situations) for convenience. In
+  /// this case, we rely on the result rank to determine `keepdim`.
+  FailureOr<torch_to_linalg::ReductionOpInfo>
+  computeReductionOpInfoFromDimList(Operation *op, Value tensorOperand,
+                                    Value dimsValue,
+                                    ConversionPatternRewriter &rewriter) const {
+    auto opInfo = torch_to_linalg::ReductionOpInfo{false, tensorOperand, {}};
+    auto inputType = cast<RankedTensorType>(tensorOperand.getType());
+
+    SmallVector<int64_t> dimList;
+    bool isNoneOrEmptyDimList = isa<Torch::NoneType>(dimsValue.getType());
+    if (matchPattern(dimsValue, m_TorchListOfConstantInts(dimList))) {
+      for (int64_t dim : dimList) {
+        dim = toPositiveDim(dim, inputType.getRank());
+        if (isValidDim(dim, inputType.getRank()))
+          opInfo.dimSet.insert(dim);
+      }
+      if (dimList.empty())
+        isNoneOrEmptyDimList = true;
+    } else if (!isNoneOrEmptyDimList) {
+      return rewriter.notifyMatchFailure(
+          op, "`dims` argument must be a constant int list or None");
+    }
+    if (isNoneOrEmptyDimList) {
+      for (int64_t i = 0; i < inputType.getRank(); i++)
+        opInfo.dimSet.insert(i);
+    }
+
+    // Infer `keepdim` from the result type's rank. prims ops do not carry
+    // a `keepdim` operand, so the only signal is the shape of the op's
+    // declared result. The result must exactly match the expected reduced
+    // shape: reduced dimensions are size 1 (keepdim) or dropped (no
+    // keepdim), and non-reduced dimensions match the input.
+    auto resultTensorType =
+        cast<Torch::BaseTensorType>(op->getResult(0).getType());
+    if (!resultTensorType.hasSizes())
+      return rewriter.notifyMatchFailure(op,
+                                         "result tensor must have known sizes");
+
+    int64_t inputRank = inputType.getRank();
+    ArrayRef<int64_t> inputSizes = inputType.getShape();
+    ArrayRef<int64_t> resultSizes = resultTensorType.getSizes();
+    int64_t resultRank = static_cast<int64_t>(resultSizes.size());
+
+    int64_t numReduced = static_cast<int64_t>(opInfo.dimSet.size());
+    if (resultRank == inputRank) {
+      opInfo.keepDim = true;
+      for (int64_t i = 0; i < inputRank; ++i) {
+        int64_t expected = opInfo.dimSet.contains(i) ? 1 : inputSizes[i];
+        if (resultSizes[i] != expected)
+          return rewriter.notifyMatchFailure(
+              op, "result shape does not match expected reduced shape");
+      }
+    } else if (resultRank == inputRank - numReduced) {
+      int64_t j = 0;
+      for (int64_t i = 0; i < inputRank; ++i) {
+        if (opInfo.dimSet.contains(i))
+          continue;
+        if (resultSizes[j] != inputSizes[i])
+          return rewriter.notifyMatchFailure(
+              op, "result shape does not match expected reduced shape");
+        ++j;
+      }
+    } else {
+      return rewriter.notifyMatchFailure(
+          op, "result rank does not match input rank (keepdim) nor "
+              "input rank minus the number of reduced dims");
+    }
+
+    return opInfo;
+  }
+
   /// Given a reduction operation, return the source tensor operand and the
   /// literal values of the `keepdim` and `dim` attributes, if any, or failure
   /// otherwise.
@@ -543,6 +635,16 @@ private:
     if (auto anyOp = dyn_cast<AtenAnyDimsOp>(op))
       return computeReductionOpInfoForDimVariantOp(anyOp, operands, rewriter);
 
+    if (auto anyDimOp = dyn_cast<AtenAnyDimOp>(op))
+      return computeReductionOpInfoForDimVariantOp(anyDimOp, operands,
+                                                   rewriter);
+
+    if (auto primsProdOp = dyn_cast<PrimsProdOp>(op)) {
+      PrimsProdOp::Adaptor adaptor(operands);
+      return computeReductionOpInfoFromDimList(op, adaptor.getInp(),
+                                               primsProdOp.getDims(), rewriter);
+    }
+
     return rewriter.notifyMatchFailure(op, "not a supported reduce op");
   }
 
@@ -575,16 +677,6 @@ private:
                                  ConversionPatternRewriter &rewriter) const {
     // Cast `ord` to float so that we can readily pass it math.powf.
     Value ordValue = convertScalarToDtype(rewriter, loc, ordOp, elemType);
-
-    // TODO: Add support for ord = {0, +inf, -inf}.
-    auto epsilon = 1e-5;
-    auto ordLiteral = 0.0;
-    if (matchPattern(ordValue, m_TorchConstantFloat(&ordLiteral)) &&
-        fabs(ordLiteral) < epsilon)
-      return rewriter.notifyMatchFailure(op, "unimplemented: L0 norm");
-
-    if (std::isinf(ordLiteral))
-      return rewriter.notifyMatchFailure(op, "unimplemented: ord = +/- inf");
 
     // Raise each summed value to the inverse of the order of the norm.
     TypedAttr oneAttr = rewriter.getFloatAttr(elemType, 1.0);
@@ -619,7 +711,8 @@ private:
       err = !result;
     };
 
-    Value initElem = createInitElementForReduceOp(rewriter, loc, op, elemType);
+    Value initElem = createInitElementForReduceOp(rewriter, loc, op, elemType,
+                                                  this->allowNonFinites);
     Value reduceOp = torch_to_linalg::createReductionLinalgGeneric(
         rewriter, loc, opInfo, initElem, reductionBodyBuilder);
     return err ? Value{} : reduceOp;
@@ -643,15 +736,38 @@ private:
   }
 
 public:
-  ConvertReductionOp(TypeConverter &typeConverter, MLIRContext *context)
+  ConvertReductionOp(TypeConverter &typeConverter, MLIRContext *context,
+                     bool allowNonFinites)
       : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), /*benefit=*/1,
-                          context) {}
+                          context),
+        allowNonFinites(allowNonFinites) {}
+
   LogicalResult
   matchAndRewrite(Operation *op, ArrayRef<Value> operands,
                   ConversionPatternRewriter &rewriter) const override {
     if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
       return rewriter.notifyMatchFailure(
           op, "invalid operand or result types to use with linalg on tensors");
+
+    // ord = 0 (count of nonzeros, imported as an int) and ord = +/-inf (min/max
+    // of absolute values, imported as a float) are handled by
+    // DecomposeAtenLinalgVectorNormOp; the generic (sum |x|^ord)^(1/ord)
+    // lowering is undefined for them. Decline before creating any IR so that a
+    // miscompile cannot slip through if decomposition is disabled. Match on the
+    // original `ord` scalar; a non-constant ord is left to the generic path.
+    if (auto normOp = dyn_cast<AtenLinalgVectorNormOp>(op)) {
+      double ordLiteral;
+      int64_t ordInt;
+      bool isConstOrd = true;
+      if (matchPattern(normOp.getOrd(), m_TorchConstantInt(&ordInt)))
+        ordLiteral = static_cast<double>(ordInt);
+      else if (!matchPattern(normOp.getOrd(),
+                             m_TorchConstantFloat(&ordLiteral)))
+        isConstOrd = false;
+      if (isConstOrd && (ordLiteral == 0.0 || std::isinf(ordLiteral)))
+        return rewriter.notifyMatchFailure(
+            op, "ord = 0 / +/-inf are handled by decomposition");
+    }
 
     FailureOr<torch_to_linalg::ReductionOpInfo> opInfo =
         computeReductionOpInfo(op, operands, rewriter);
@@ -712,24 +828,28 @@ public:
 
 void mlir::torch::torch_to_linalg::populateReductionPatternsAndLegality(
     TypeConverter &typeConverter, RewritePatternSet &patterns,
-    ConversionTarget &target) {
+    ConversionTarget &target, bool allowNonFinites) {
   MLIRContext *context = patterns.getContext();
   target.addIllegalOp<AtenMaxDimOp>();
-  patterns.add<ConvertAtenMinMaxDimOp<AtenMaxDimOp>>(typeConverter, context);
+  patterns.add<ConvertAtenMinMaxDimOp<AtenMaxDimOp>>(typeConverter, context,
+                                                     allowNonFinites);
   target.addIllegalOp<AtenMinDimOp>();
-  patterns.add<ConvertAtenMinMaxDimOp<AtenMinDimOp>>(typeConverter, context);
+  patterns.add<ConvertAtenMinMaxDimOp<AtenMinDimOp>>(typeConverter, context,
+                                                     allowNonFinites);
   target.addIllegalOp<AtenSumOp>();
   target.addIllegalOp<AtenAnyOp>();
+  target.addIllegalOp<AtenAnyDimOp>();
   target.addIllegalOp<AtenAnyDimsOp>();
   target.addIllegalOp<AtenAllOp>();
   target.addIllegalOp<AtenSumDimIntListOp>();
   target.addIllegalOp<AtenProdOp>();
   target.addIllegalOp<AtenProdDimIntOp>();
+  target.addIllegalOp<PrimsProdOp>();
   target.addIllegalOp<AtenMaxOp>();
   target.addIllegalOp<AtenMinOp>();
   target.addIllegalOp<AtenAllDimOp>();
   target.addIllegalOp<AtenNormScalarOp>();
   target.addIllegalOp<AtenLinalgVectorNormOp>();
   target.addIllegalOp<AtenFrobeniusNormDimOp>();
-  patterns.add<ConvertReductionOp>(typeConverter, context);
+  patterns.add<ConvertReductionOp>(typeConverter, context, allowNonFinites);
 }

@@ -486,6 +486,20 @@ func.func @torch.aten.relu(%arg0: !torch.vtensor<[?,?],f32>) -> !torch.vtensor<[
 
 // -----
 
+// CHECK-LABEL:  func.func @torch.aten.relu$int(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[?,?],si64>) -> !torch.vtensor<[?,?],si64> {
+// CHECK:         %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,?],si64> -> tensor<?x?xi64>
+// CHECK:         %[[T1:.*]] = "chlo.constant_like"(%[[T0]]) <{value = 0 : i64}> : (tensor<?x?xi64>) -> tensor<?x?xi64>
+// CHECK:         %[[T2:.*]] = stablehlo.maximum %[[T0]], %[[T1]] : tensor<?x?xi64>
+// CHECK:         %[[T3:.*]] = torch_c.from_builtin_tensor %[[T2]] : tensor<?x?xi64> -> !torch.vtensor<[?,?],si64>
+// CHECK:         return %[[T3]] : !torch.vtensor<[?,?],si64>
+func.func @torch.aten.relu$int(%arg0: !torch.vtensor<[?,?],si64>) -> !torch.vtensor<[?,?],si64> {
+  %0 = torch.aten.relu %arg0 : !torch.vtensor<[?,?],si64> -> !torch.vtensor<[?,?],si64>
+  return %0 : !torch.vtensor<[?,?],si64>
+}
+
+// -----
+
 // CHECK-LABEL:  func.func @torch.aten.addscalar$variable(
 // CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[?,?],f32>, %[[ARG1:.*]]: !torch.float) -> !torch.vtensor<[?,?],f32> {
 // CHECK-DAG:     %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,?],f32> -> tensor<?x?xf32>
@@ -625,4 +639,51 @@ func.func @torch.aten.div.Tensor_mode$floor(%arg0: !torch.vtensor<[?,?,?,?],f32>
 func.func @torch.aten.abs(%arg0: !torch.vtensor<[15,15],si64>) -> !torch.vtensor<[15,15],si64>{
   %0 = torch.aten.abs %arg0 : !torch.vtensor<[15,15],si64> -> !torch.vtensor<[15,15],si64>
   return %0 : !torch.vtensor<[15,15],si64>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.polar$f32(
+// CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[3,4],f32>,
+// CHECK-SAME:         %[[ARG1:.*]]: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[3,4],complex<f32>> {
+// CHECK:         %[[ANGLE:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[3,4],f32> -> tensor<3x4xf32>
+// CHECK:         %[[ABS:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[3,4],f32> -> tensor<3x4xf32>
+// CHECK:         %[[COS:.*]] = stablehlo.cosine %[[ANGLE]] : tensor<3x4xf32>
+// CHECK:         %[[SIN:.*]] = stablehlo.sine %[[ANGLE]] : tensor<3x4xf32>
+// CHECK:         %[[RE:.*]] = stablehlo.multiply %[[ABS]], %[[COS]] : tensor<3x4xf32>
+// CHECK:         %[[IM:.*]] = stablehlo.multiply %[[ABS]], %[[SIN]] : tensor<3x4xf32>
+// CHECK:         %[[OUT:.*]] = stablehlo.complex %[[RE]], %[[IM]] : tensor<3x4xcomplex<f32>>
+// CHECK:         %[[RES:.*]] = torch_c.from_builtin_tensor %[[OUT]] : tensor<3x4xcomplex<f32>> -> !torch.vtensor<[3,4],complex<f32>>
+// CHECK:         return %[[RES]] : !torch.vtensor<[3,4],complex<f32>>
+func.func @torch.aten.polar$f32(%arg0: !torch.vtensor<[3,4],f32>, %arg1: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[3,4],complex<f32>> {
+  %0 = torch.aten.polar %arg0, %arg1 : !torch.vtensor<[3,4],f32>, !torch.vtensor<[3,4],f32> -> !torch.vtensor<[3,4],complex<f32>>
+  return %0 : !torch.vtensor<[3,4],complex<f32>>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.polar$f64(
+// CHECK:         %[[COS:.*]] = stablehlo.cosine %{{.*}} : tensor<2xf64>
+// CHECK:         %[[SIN:.*]] = stablehlo.sine %{{.*}} : tensor<2xf64>
+// CHECK:         %[[RE:.*]] = stablehlo.multiply %{{.*}}, %[[COS]] : tensor<2xf64>
+// CHECK:         %[[IM:.*]] = stablehlo.multiply %{{.*}}, %[[SIN]] : tensor<2xf64>
+// CHECK:         stablehlo.complex %[[RE]], %[[IM]] : tensor<2xcomplex<f64>>
+func.func @torch.aten.polar$f64(%arg0: !torch.vtensor<[2],f64>, %arg1: !torch.vtensor<[2],f64>) -> !torch.vtensor<[2],complex<f64>> {
+  %0 = torch.aten.polar %arg0, %arg1 : !torch.vtensor<[2],f64>, !torch.vtensor<[2],f64> -> !torch.vtensor<[2],complex<f64>>
+  return %0 : !torch.vtensor<[2],complex<f64>>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.polar$dynamic(
+// CHECK:         %[[COS:.*]] = stablehlo.cosine %{{.*}} : tensor<?x?xf32>
+// CHECK:         %[[SIN:.*]] = stablehlo.sine %{{.*}} : tensor<?x?xf32>
+// COM: No shape.assuming / dynamic_broadcast_in_dim: the shapes already match.
+// CHECK-NOT:     chlo.broadcast_multiply
+// CHECK:         %[[RE:.*]] = stablehlo.multiply %{{.*}}, %[[COS]] : tensor<?x?xf32>
+// CHECK:         %[[IM:.*]] = stablehlo.multiply %{{.*}}, %[[SIN]] : tensor<?x?xf32>
+// CHECK:         stablehlo.complex %[[RE]], %[[IM]] : tensor<?x?xcomplex<f32>>
+func.func @torch.aten.polar$dynamic(%arg0: !torch.vtensor<[?,?],f32>, %arg1: !torch.vtensor<[?,?],f32>) -> !torch.vtensor<[?,?],complex<f32>> {
+  %0 = torch.aten.polar %arg0, %arg1 : !torch.vtensor<[?,?],f32>, !torch.vtensor<[?,?],f32> -> !torch.vtensor<[?,?],complex<f32>>
+  return %0 : !torch.vtensor<[?,?],complex<f32>>
 }

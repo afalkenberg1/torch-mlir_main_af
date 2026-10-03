@@ -19,7 +19,8 @@ mkdir -p "${cache_dir}/ccache"
 mkdir -p "${cache_dir}/pip"
 
 export CCACHE_DIR="${cache_dir}/ccache"
-export CCACHE_MAXSIZE="350M"
+export CCACHE_MAXSIZE="700M"
+export CCACHE_SLOPPINESS="pch_defines,time_macros"
 
 # Clear ccache stats.
 ccache -z
@@ -27,6 +28,9 @@ ccache -z
 echo "::group::CMake configure"
 cmake -GNinja -Bbuild \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_DISABLE_PRECOMPILE_HEADERS="${CMAKE_DISABLE_PRECOMPILE_HEADERS:-ON}" \
+  -DCMAKE_C_COMPILER=clang-cl \
+  -DCMAKE_CXX_COMPILER=clang-cl \
   -DCMAKE_C_COMPILER_LAUNCHER=ccache \
   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
   -DLLVM_ENABLE_PROJECTS=mlir \
@@ -38,7 +42,7 @@ cmake -GNinja -Bbuild \
   -DLLVM_EXTERNAL_TORCH_MLIR_SOURCE_DIR="$PWD" \
   -DPython3_EXECUTABLE="$(which python)" \
   -DPython_EXECUTABLE="$(which python)" \
-  -DTORCH_MLIR_ENABLE_STABLEHLO=OFF \
+  -DTORCH_MLIR_ENABLE_STABLEHLO="${TORCH_MLIR_ENABLE_STABLEHLO:-ON}" \
   -DTORCH_MLIR_ENABLE_PYTORCH_EXTENSIONS=ON \
   -DTORCH_MLIR_ENABLE_LTC=OFF \
   -DTORCH_MLIR_ENABLE_JIT_IR_IMPORTER=ON \

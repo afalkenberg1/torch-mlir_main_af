@@ -419,13 +419,20 @@ template <typename OpTy>
 class ConvertAtenMaxPoolOp : public OpConversionPattern<OpTy> {
   using OpConversionPattern<OpTy>::OpConversionPattern;
 
+public:
+  ConvertAtenMaxPoolOp(TypeConverter &typeConverter, MLIRContext *context,
+                       bool allowNonFinites)
+      : OpConversionPattern<OpTy>(typeConverter, context),
+        allowNonFinites(allowNonFinites) {}
+
+private:
   static const bool withIndices =
       llvm::is_one_of<OpTy, AtenMaxPool1dWithIndicesOp,
                       AtenMaxPool2dWithIndicesOp,
                       AtenMaxPool3dWithIndicesOp>::value;
 
-private:
   static const int64_t Dim = DimensionTraits<OpTy>::Dim;
+  bool allowNonFinites;
 
   LogicalResult createPoolingMax3D(OpTy &op, typename OpTy::Adaptor adaptor,
                                    ConversionPatternRewriter &rewriter,
@@ -439,10 +446,10 @@ private:
     static_assert(Dim == 3, "op must be MaxPool3d or MaxPool3dWithIndices");
     Value self = adaptor.getSelf();
     Type elementType = cast<RankedTensorType>(self.getType()).getElementType();
+
     TypedAttr smallestFPValueAttr = rewriter.getFloatAttr(
-        elementType,
-        APFloat::getInf(cast<mlir::FloatType>(elementType).getFloatSemantics(),
-                        /*Negative=*/true));
+        elementType, getFloatInf(cast<mlir::FloatType>(elementType),
+                                 /*negative = */ true, this->allowNonFinites));
     Value initValue =
         arith::ConstantOp::create(rewriter, op->getLoc(), smallestFPValueAttr);
 
@@ -688,7 +695,7 @@ public:
     if (auto fpty = dyn_cast<mlir::FloatType>(elementType)) {
       smallestValueAttr = rewriter.getFloatAttr(
           elementType,
-          APFloat::getInf(fpty.getFloatSemantics(), /*Negative=*/true));
+          getFloatInf(fpty, /*Negative=*/true, this->allowNonFinites));
     } else if (auto intTy = dyn_cast<mlir::IntegerType>(elementType)) {
       int64_t bw = intTy.getIntOrFloatBitWidth();
       smallestValueAttr = rewriter.getIntegerAttr(
@@ -953,7 +960,8 @@ public:
   // height and width labels in variables.
   Value getPoolSize(OpBuilder &b, SmallVectorImpl<Value> &kernelSizeIntValues,
                     SmallVectorImpl<int64_t> &strideInts,
-                    SmallVectorImpl<int64_t> &paddingInts);
+                    SmallVectorImpl<int64_t> &paddingInts,
+                    SmallVectorImpl<int64_t> &dilationInts);
 
 private:
   int64_t SumPoolTypeDimIndex[NumOfDims];
@@ -987,12 +995,14 @@ PoolSizeCalculator<NumOfDims>::PoolSizeCalculator(
 template <int NumOfDims>
 Value PoolSizeCalculator<NumOfDims>::getPoolSize(
     OpBuilder &b, SmallVectorImpl<Value> &kernelDimSizes,
-    SmallVectorImpl<int64_t> &strideInts,
-    SmallVectorImpl<int64_t> &paddingInts) {
+    SmallVectorImpl<int64_t> &strideInts, SmallVectorImpl<int64_t> &paddingInts,
+    SmallVectorImpl<int64_t> &dilationInts) {
   Value poolSize;
 
   Value cstZero =
       b.createOrFold<arith::ConstantOp>(location, b.getI64IntegerAttr(0));
+  Value cstOne =
+      b.createOrFold<arith::ConstantOp>(location, b.getI64IntegerAttr(1));
 
   for (int i = 0; i < NumOfDims; ++i) {
     // See the link below for the PyTorch implementation where this is
@@ -1007,27 +1017,70 @@ Value PoolSizeCalculator<NumOfDims>::getPoolSize(
     Value ODim = castIndexToInt64(b, location, IndexODim);
     Value DDim = b.createOrFold<arith::ConstantOp>(
         location, b.getI64IntegerAttr(strideInts[i]));
-    Value PadDim = b.createOrFold<arith::ConstantOp>(
+    Value PadBeginDim = b.createOrFold<arith::ConstantOp>(
         location, b.getI64IntegerAttr(paddingInts[i]));
+    // Asymmetric padding is encoded as [begin..., end...].
+    int64_t padEndInt = (int64_t)paddingInts.size() == 2 * NumOfDims
+                            ? paddingInts[i + NumOfDims]
+                            : paddingInts[i];
+    Value PadEndDim = b.createOrFold<arith::ConstantOp>(
+        location, b.getI64IntegerAttr(padEndInt));
+    Value DilDim = b.createOrFold<arith::ConstantOp>(
+        location, b.getI64IntegerAttr(dilationInts[i]));
     Value ODimDDim = b.createOrFold<arith::MulIOp>(location, ODim, DDim);
-    Value IDim0 = b.createOrFold<arith::SubIOp>(location, ODimDDim, PadDim);
+    Value IDim0 =
+        b.createOrFold<arith::SubIOp>(location, ODimDDim, PadBeginDim);
     Value IDim = castIndexToInt64(b, location, InputSpatialDimSizes[i]);
+
+    // Effective window end: IDim0 + (kernel - 1) * dilation + 1
+    Value KernelM1 =
+        b.createOrFold<arith::SubIOp>(location, kernelDimSizes[i], cstOne);
+    Value KernelM1Dil =
+        b.createOrFold<arith::MulIOp>(location, KernelM1, DilDim);
+    Value EffectiveKernel =
+        b.createOrFold<arith::AddIOp>(location, KernelM1Dil, cstOne);
     Value IDim0KDim =
-        b.createOrFold<arith::AddIOp>(location, IDim0, kernelDimSizes[i]);
-    Value IDimPadDim = b.createOrFold<arith::AddIOp>(location, IDim, PadDim);
+        b.createOrFold<arith::AddIOp>(location, IDim0, EffectiveKernel);
+    Value IDimPadEndDim =
+        b.createOrFold<arith::AddIOp>(location, IDim, PadEndDim);
     Value IDim1 =
-        b.createOrFold<arith::MinSIOp>(location, IDim0KDim, IDimPadDim);
+        b.createOrFold<arith::MinSIOp>(location, IDim0KDim, IDimPadEndDim);
 
-    Value IDim0Clamped =
-        b.createOrFold<arith::MaxSIOp>(location, IDim0, cstZero);
     Value IDim1Clamped = b.createOrFold<arith::MinSIOp>(location, IDim1, IDim);
-    Value IDim1_IDim0_Clamped =
-        b.createOrFold<arith::SubIOp>(location, IDim1Clamped, IDim0Clamped);
 
-    Value poolSizeDim =
-        !isCountIncludePad
-            ? IDim1_IDim0_Clamped
-            : b.createOrFold<arith::SubIOp>(location, IDim1, IDim0);
+    // Count valid taps using k_min/k_max approach:
+    // Tap k is valid when IDim0 + k*dilation is in [0, IDim1Clamped), where
+    // IDim1Clamped = min(window end, IDim) is the input extent clamped to the
+    // window.
+    // k_min = ceil(max(-IDim0, 0) / dilation)  -- first valid k
+    // k_max_excl = ceil((IDim1Clamped - IDim0) / dilation)  -- first k past the
+    // end ValidTaps = max(k_max_excl - k_min, 0)
+    Value NegIDim0 = b.createOrFold<arith::SubIOp>(location, cstZero, IDim0);
+    Value KMinNumer =
+        b.createOrFold<arith::MaxSIOp>(location, NegIDim0, cstZero);
+    Value KMin =
+        b.createOrFold<arith::CeilDivSIOp>(location, KMinNumer, DilDim);
+    Value IDim1ClampedMinusIDim0 =
+        b.createOrFold<arith::SubIOp>(location, IDim1Clamped, IDim0);
+    Value KMaxExcl = b.createOrFold<arith::CeilDivSIOp>(
+        location, IDim1ClampedMinusIDim0, DilDim);
+    Value KDiff = b.createOrFold<arith::SubIOp>(location, KMaxExcl, KMin);
+    Value ValidTaps = b.createOrFold<arith::MaxSIOp>(location, KDiff, cstZero);
+
+    // For count_include_pad: count every dilated tap position in the full
+    // effective window [IDim0, IDim1), including padded positions. Same as
+    // ValidTaps but WITHOUT the low-side clamp (padded taps are counted), so
+    // it reduces to k_min == 0:
+    //   FullTaps = max(ceil((IDim1 - IDim0) / dilation), 0)
+    // The max(.., 0) keeps this in agreement with ValidTaps on a degenerate
+    // empty window (range <= 0 => 0 taps).
+    Value FullRange = b.createOrFold<arith::SubIOp>(location, IDim1, IDim0);
+    Value FullTapsRaw =
+        b.createOrFold<arith::CeilDivSIOp>(location, FullRange, DilDim);
+    Value FullTaps =
+        b.createOrFold<arith::MaxSIOp>(location, FullTapsRaw, cstZero);
+
+    Value poolSizeDim = !isCountIncludePad ? ValidTaps : FullTaps;
     if (i == 0) {
       poolSize = poolSizeDim;
     } else {
@@ -1053,7 +1106,8 @@ public:
   static bool
   doesAvgPoolDivisorNeedsClamping(bool ceilMode, bool countIncludePad,
                                   SmallVectorImpl<int64_t> &strideInts,
-                                  SmallVectorImpl<int64_t> &paddingInts);
+                                  SmallVectorImpl<int64_t> &paddingInts,
+                                  SmallVectorImpl<int64_t> &dilationInts);
 
   // Creates the average pooling operation value with a clamped
   // divisor. The clamped divisor is the product of kernel
@@ -1066,6 +1120,7 @@ public:
       SmallVectorImpl<Value> &kernelDimSizes,
       SmallVectorImpl<int64_t> &strideInts,
       SmallVectorImpl<int64_t> &paddingInts,
+      SmallVectorImpl<int64_t> &dilationInts,
       SmallVector<AffineMap> &indexingMapsAvg,
       SmallVector<utils::IteratorType> &iteratorTypesAvg);
 
@@ -1140,11 +1195,11 @@ LogicalResult ConvertAtenAvgPoolOp<OpTy, PoolingOpTy, Dim>::matchAndRewrite(
       Dim + 2, utils::IteratorType::parallel);
 
   if (doesAvgPoolDivisorNeedsClamping(ceilMode, countIncludePad, strideInts,
-                                      paddingInts)) {
+                                      paddingInts, dilationInts)) {
     return createAveragePoolValueWithClampedDivisor(
         ceilMode, countIncludePad, op, adaptor, rewriter, self, sumPool,
         outputTensor, resultType, kernelSizeIntValues, strideInts, paddingInts,
-        indexingMapsAvg, iteratorTypesAvg);
+        dilationInts, indexingMapsAvg, iteratorTypesAvg);
   }
 
   return createAveragePoolValueWithRegularDivisor(
@@ -1156,7 +1211,8 @@ template <typename OpTy, typename PoolingOpTy, int Dim>
 bool ConvertAtenAvgPoolOp<OpTy, PoolingOpTy, Dim>::
     doesAvgPoolDivisorNeedsClamping(bool ceilMode, bool countIncludePad,
                                     SmallVectorImpl<int64_t> &strideInts,
-                                    SmallVectorImpl<int64_t> &paddingInts) {
+                                    SmallVectorImpl<int64_t> &paddingInts,
+                                    SmallVectorImpl<int64_t> &dilationInts) {
   // Determines whether the average pooling divisor needs to be clamped
   // (i.e., adjusted to exclude padded or out-of-bounds elements).
   //
@@ -1186,8 +1242,11 @@ bool ConvertAtenAvgPoolOp<OpTy, PoolingOpTy, Dim>::
       !llvm::all_of(paddingInts, [](int64_t p) { return p == 0; });
   bool allStridesUnitary =
       llvm::all_of(strideInts, [](int64_t s) { return s == 1; });
+  bool allDilationsUnitary =
+      llvm::all_of(dilationInts, [](int64_t d) { return d == 1; });
 
-  return (!countIncludePad && hasPadding) || (ceilMode && !allStridesUnitary);
+  return (!countIncludePad && hasPadding) || (ceilMode && !allStridesUnitary) ||
+         !allDilationsUnitary;
 }
 
 template <typename OpTy, typename PoolingOpTy, int Dim>
@@ -1199,6 +1258,7 @@ LogicalResult ConvertAtenAvgPoolOp<OpTy, PoolingOpTy, Dim>::
         SmallVectorImpl<Value> &kernelDimSizes,
         SmallVectorImpl<int64_t> &strideInts,
         SmallVectorImpl<int64_t> &paddingInts,
+        SmallVectorImpl<int64_t> &dilationInts,
         SmallVector<AffineMap> &indexingMapsAvg,
         SmallVector<utils::IteratorType> &iteratorTypesAvg) {
   Location loc = op->getLoc();
@@ -1234,7 +1294,7 @@ LogicalResult ConvertAtenAvgPoolOp<OpTy, PoolingOpTy, Dim>::
           [&](OpBuilder &b, Location loc, ValueRange args) {
             if (!poolSize) {
               poolSize = poolSizeCalculator.getPoolSize(
-                  b, kernelDimSizes, strideInts, paddingInts);
+                  b, kernelDimSizes, strideInts, paddingInts, dilationInts);
             }
             Value divisor =
                 convertScalarToDtype(b, loc, poolSize, resultElementType);
@@ -1361,7 +1421,8 @@ public:
                                RankedTensorType &outputType,
                                RankedTensorType &auxTensorType, Value &buffVal,
                                Value &auxTensor,
-                               SmallVector<AffineExpr> &auxTensorExprs) {
+                               SmallVector<AffineExpr> &auxTensorExprs,
+                               bool allowNonFinites) {
 
     Location loc = op->getLoc();
     const TypeConverter *typeConverter = opConversionPattern.getTypeConverter();
@@ -1371,9 +1432,8 @@ public:
         typeConverter->convertType(op.getResult1().getType()));
     Type auxTensorElementType = auxTensorType.getElementType();
     auto smallestFPValueAttr = rewriter.getFloatAttr(
-        elementType,
-        APFloat::getInf(cast<mlir::FloatType>(elementType).getFloatSemantics(),
-                        /*Negative=*/true));
+        elementType, getFloatInf(cast<mlir::FloatType>(elementType),
+                                 /*Negative=*/true, allowNonFinites));
     buffVal = arith::ConstantOp::create(rewriter, loc, elementType,
                                         smallestFPValueAttr);
     auxTensor = tensor::EmptyOp::create(
@@ -1443,7 +1503,8 @@ public:
                                RankedTensorType &outputType,
                                RankedTensorType &auxTensorType, Value &buffVal,
                                Value &auxTensor,
-                               SmallVector<AffineExpr> &auxTensorExprs) {
+                               SmallVector<AffineExpr> &auxTensorExprs,
+                               bool allowNonFinites) {
 
     Location loc = op->getLoc();
     const TypeConverter *typeConverter = opConversionPattern.getTypeConverter();
@@ -1555,8 +1616,15 @@ template <typename OpTy>
 class ConvertAtenAdaptivePoolOp : public OpConversionPattern<OpTy> {
   using OpConversionPattern<OpTy>::OpConversionPattern;
 
+public:
+  ConvertAtenAdaptivePoolOp(TypeConverter &typeConverter, MLIRContext *context,
+                            bool allowNonFinites)
+      : OpConversionPattern<OpTy>(typeConverter, context),
+        allowNonFinites(allowNonFinites) {}
+
 private:
   static const int64_t Dim = AdaptivePoolingOpTraits<OpTy>::Dim;
+  bool allowNonFinites;
 
 public:
   LogicalResult
@@ -1631,7 +1699,7 @@ public:
     SmallVector<AffineExpr> auxTensorExprs;
     if (failed(adaptivePoolingHelper.auxTensorSetup(
             op, outputSizes, outShapeIndexVector, outputType, auxTensorType,
-            buffVal, auxTensor, auxTensorExprs))) {
+            buffVal, auxTensor, auxTensorExprs, this->allowNonFinites))) {
       return rewriter.notifyMatchFailure(op, "failed auxTensor setup");
     }
 
@@ -1754,24 +1822,27 @@ public:
 
 void mlir::torch::torch_to_linalg::populatePoolingPatternsAndLegality(
     TypeConverter &typeConverter, RewritePatternSet &patterns,
-    ConversionTarget &target) {
+    ConversionTarget &target, bool allowNonFinites) {
   MLIRContext *context = patterns.getContext();
   target.addIllegalOp<AtenMaxPool1dOp>();
   target.addIllegalOp<AtenMaxPool2dOp>();
   target.addIllegalOp<AtenMaxPool3dOp>();
-  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool1dOp>>(typeConverter, context);
-  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool2dOp>>(typeConverter, context);
-  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool3dOp>>(typeConverter, context);
+  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool1dOp>>(typeConverter, context,
+                                                      allowNonFinites);
+  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool2dOp>>(typeConverter, context,
+                                                      allowNonFinites);
+  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool3dOp>>(typeConverter, context,
+                                                      allowNonFinites);
 
   target.addIllegalOp<AtenMaxPool1dWithIndicesOp>();
   target.addIllegalOp<AtenMaxPool2dWithIndicesOp>();
   target.addIllegalOp<AtenMaxPool3dWithIndicesOp>();
-  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool1dWithIndicesOp>>(typeConverter,
-                                                                 context);
-  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool2dWithIndicesOp>>(typeConverter,
-                                                                 context);
-  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool3dWithIndicesOp>>(typeConverter,
-                                                                 context);
+  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool1dWithIndicesOp>>(
+      typeConverter, context, allowNonFinites);
+  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool2dWithIndicesOp>>(
+      typeConverter, context, allowNonFinites);
+  patterns.add<ConvertAtenMaxPoolOp<AtenMaxPool3dWithIndicesOp>>(
+      typeConverter, context, allowNonFinites);
 
   target.addIllegalOp<AtenMaxUnpool3dOp>();
   patterns.add<ConvertAtenMaxUnpool3dOp>(typeConverter, context);

@@ -165,6 +165,46 @@ def BatchNorm1DStaticShapeModule_basic(module, tu: TestUtils):
 # ==============================================================================
 
 
+class BatchNormInferenceF16Module(torch.nn.Module):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([2, 2, 3], torch.float16, True),
+            ([2], torch.float16, True),
+            ([2], torch.float16, True),
+            ([2], torch.float16, True),
+            ([2], torch.float16, True),
+        ]
+    )
+    def forward(self, x, weight, bias, running_mean, running_var):
+        return torch.ops.aten.batch_norm(
+            x,
+            weight,
+            bias,
+            running_mean,
+            running_var,
+            training=False,
+            momentum=0.1,
+            eps=0.5,
+            cudnn_enabled=False,
+        )
+
+
+@register_test_case(module_factory=lambda: BatchNormInferenceF16Module())
+def BatchNormInferenceF16Module_basic(module, tu: TestUtils):
+    module.forward(
+        tu.rand(2, 2, 3).to(torch.float16),
+        tu.rand(2).to(torch.float16),
+        tu.rand(2).to(torch.float16),
+        tu.rand(2).to(torch.float16),
+        tu.rand(2).to(torch.float16),
+    )
+
+
+# ==============================================================================
+
+
 class NativeBatchNorm1DModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -305,6 +345,74 @@ class NativeBatchNormNoneWeightModule(torch.nn.Module):
 @register_test_case(module_factory=lambda: NativeBatchNormNoneWeightModule())
 def NativeBatchNormNoneWeightModule_basic(module, tu: TestUtils):
     module.forward(tu.rand(2, 5, 2, 2, 3), tu.rand(5), tu.rand(5), tu.rand(5))
+
+
+# ==============================================================================
+
+
+class NativeBatchNorm1DTrainingModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1, -1, -1], torch.float32, True),
+            ([-1], torch.float32, True),
+            ([-1], torch.float32, True),
+        ]
+    )
+    def forward(self, x, weight, bias):
+        return torch.ops.aten.native_batch_norm(
+            x,
+            weight,
+            bias,
+            None,
+            None,
+            training=True,
+            momentum=0.1,
+            eps=0.00001,
+        )
+
+
+@register_test_case(module_factory=lambda: NativeBatchNorm1DTrainingModule())
+def NativeBatchNorm1DTrainingModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(2, 5, 3), tu.rand(5), tu.rand(5))
+
+
+# ==============================================================================
+
+
+class NativeBatchNorm2DTrainingModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1, -1, -1, -1], torch.float32, True),
+            ([-1], torch.float32, True),
+            ([-1], torch.float32, True),
+        ]
+    )
+    def forward(self, x, weight, bias):
+        return torch.ops.aten.native_batch_norm(
+            x,
+            weight,
+            bias,
+            None,
+            None,
+            training=True,
+            momentum=0.1,
+            eps=0.00001,
+        )
+
+
+@register_test_case(module_factory=lambda: NativeBatchNorm2DTrainingModule())
+def NativeBatchNorm2DTrainingModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(2, 5, 2, 3), tu.rand(5), tu.rand(5))
 
 
 # ==============================================================================
@@ -552,6 +660,36 @@ def LayerNormModule_basic(module, tu: TestUtils):
 # ==============================================================================
 
 
+class LayerNormNoBiasModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ly = torch.nn.LayerNorm([2, 2, 3], bias=False)
+        self.ly.eval()
+        self.ly.weight = torch.nn.Parameter(
+            torch.tensor(
+                [[[3.0, 2.0, 4.0], [2.0, 3.0, 3.0]], [[3.0, 2.0, 4.0], [2.0, 3.0, 3.0]]]
+            )
+        )
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([2, 5, 2, 2, 3], torch.float32, True),
+        ]
+    )
+    def forward(self, x):
+        return self.ly(x)
+
+
+@register_test_case(module_factory=lambda: LayerNormNoBiasModule())
+def LayerNormNoBiasModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(2, 5, 2, 2, 3))
+
+
+# ==============================================================================
+
+
 class LayerNormLastDimModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -635,6 +773,35 @@ def AtenInstanceNormModule_basic(module, tu: TestUtils):
     module.forward(tu.rand(1, 2, 1, 3), tu.rand(2), tu.rand(2))
 
 
+# InstanceNorm with fp16 and large spatial dims. Without f32 accumulator for mean/var,
+# this produces NaNs due to fp16 overflow. The following exercises the decomposition fix.
+class AtenInstanceNormModuleFp16(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([1, 32, 8388608], torch.float16, True),
+            ([32], torch.float16, True),
+            ([32], torch.float16, True),
+        ]
+    )
+    def forward(self, x, w, b):
+        return torch.ops.aten.instance_norm(
+            x, w, b, None, None, True, 0.0, 1e-05, False
+        )
+
+
+@register_test_case(module_factory=lambda: AtenInstanceNormModuleFp16())
+def AtenInstanceNormModuleFp16_basic(module, tu: TestUtils):
+    x = tu.rand(1, 32, 8388608).to(torch.float16)
+    w = tu.rand(32).to(torch.float16)
+    b = tu.rand(32).to(torch.float16)
+    module.forward(x, w, b)
+
+
 # ==============================================================================
 class RMSNormModule(torch.nn.Module):
     def __init__(self):
@@ -656,6 +823,28 @@ class RMSNormModule(torch.nn.Module):
 @register_test_case(module_factory=lambda: RMSNormModule())
 def RMSNormModule_basic(module, tu: TestUtils):
     module.forward(tu.rand(8, 9, 1, 2, 4), tu.rand(1, 2, 4))
+
+
+class RMSNormZeroExtentModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([0, 1], torch.float32, True),
+            ([1], torch.float32, True),
+        ]
+    )
+    def forward(self, x, weight):
+        list = [1]
+        return torch.ops.aten.rms_norm(x, list, weight, eps=0.5)
+
+
+@register_test_case(module_factory=lambda: RMSNormZeroExtentModule())
+def RMSNormZeroExtentModule_basic(module, tu: TestUtils):
+    module.forward(torch.empty(0, 1), tu.rand(1))
 
 
 class RMSNormWithoutEpsModule(torch.nn.Module):

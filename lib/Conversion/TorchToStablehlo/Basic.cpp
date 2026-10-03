@@ -15,6 +15,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/DialectResourceBlobManager.h"
 #include "stablehlo/dialect/ChloOps.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "torch-mlir/Conversion/TorchToStablehlo/StablehloLegalizeUtils.h"
@@ -24,6 +25,7 @@
 #include "torch-mlir/Dialect/Torch/Utils/TorchUpstream.h"
 #include "torch-mlir/Dialect/Torch/Utils/Utils.h"
 #include "torch-mlir/Dialect/TorchConversion/IR/TorchConversionOps.h"
+#include "llvm/Support/MathExtras.h"
 #include <cmath>
 #include <numeric>
 #include <type_traits>
@@ -72,13 +74,13 @@ bool skipMultiplyAlpha(Value alphaValue) {
 }
 
 static FailureOr<Value> getMaxValueOfDtype(Operation *op, Type elementType,
-                                           PatternRewriter &rewriter) {
+                                           PatternRewriter &rewriter,
+                                           bool allowNonFinites) {
   auto constType = RankedTensorType::get({}, elementType);
   if (isa<mlir::FloatType>(elementType)) {
     auto constAttr = SplatElementsAttr::get(
-        constType,
-        APFloat::getInf(cast<mlir::FloatType>(elementType).getFloatSemantics(),
-                        /*negative=*/false));
+        constType, getFloatInf(cast<mlir::FloatType>(elementType),
+                               /*negative=*/false, allowNonFinites));
     return stablehlo::ConstantOp::create(rewriter, op->getLoc(), constType,
                                          constAttr)
         .getResult();
@@ -101,13 +103,13 @@ static FailureOr<Value> getMaxValueOfDtype(Operation *op, Type elementType,
 }
 
 static FailureOr<Value> getMinValueOfDtype(Operation *op, Type elementType,
-                                           PatternRewriter &rewriter) {
+                                           PatternRewriter &rewriter,
+                                           bool allowNonFinites) {
   auto constType = RankedTensorType::get({}, elementType);
   if (isa<mlir::FloatType>(elementType)) {
     auto constAttr = SplatElementsAttr::get(
-        constType,
-        APFloat::getInf(cast<mlir::FloatType>(elementType).getFloatSemantics(),
-                        /*negative=*/true));
+        constType, getFloatInf(cast<mlir::FloatType>(elementType),
+                               /*negative=*/true, allowNonFinites));
     return stablehlo::ConstantOp::create(rewriter, op->getLoc(), constType,
                                          constAttr)
         .getResult();
@@ -893,8 +895,16 @@ LogicalResult ConvertAtenOp<ValueTensorLiteralOp>::matchAndRewrite(
     return success();
   }
 
-  rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, resultType,
-                                                     adaptor.getValue());
+  ElementsAttr attr = cast<ElementsAttr>(adaptor.getValue());
+  if (auto res = dyn_cast<DenseResourceElementsAttr>(attr)) {
+    // Resource-backed integer literals keep the Torch signedness in the
+    // attribute type. StableHLO integer tensors are signless, so retag the blob
+    // to the converted result type before constructing the constant.
+    auto shapedAttrTy = cast<ShapedType>(res.getType());
+    if (isa<IntegerType>(shapedAttrTy.getElementType()))
+      attr = DenseResourceElementsAttr::get(resultType, res.getRawHandle());
+  }
+  rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, resultType, attr);
   return success();
 }
 
@@ -1037,13 +1047,64 @@ LogicalResult ConvertAtenOp<AtenReluOp>::matchAndRewrite(
   auto lhsTy = cast<RankedTensorType>(lhs.getType());
   auto lhsElemTy = lhsTy.getElementType();
 
-  if (!isa<mlir::FloatType>(lhsElemTy)) {
-    return op->emitError("only float tensor in relu op is supported");
+  if (!isa<mlir::FloatType>(lhsElemTy) && !isa<mlir::IntegerType>(lhsElemTy)) {
+    return op->emitError(
+        "only float or integer tensor in relu op is supported");
   }
 
   Value zeroTensor =
       hlo::getConstantLike<int64_t>(rewriter, op->getLoc(), 0, lhs);
   rewriter.replaceOpWithNewOp<stablehlo::MaxOp>(op, lhs, zeroTensor);
+  return success();
+}
+
+// AtenPolarOp
+// Polar(abs, angle) = abs * cos(angle) + abs * sin(angle) * j
+template <>
+LogicalResult ConvertAtenOp<AtenPolarOp>::matchAndRewrite(
+    AtenPolarOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  Location loc = op.getLoc();
+
+  Value abs = adaptor.getAbs();
+  Value angle = adaptor.getAngle();
+  auto absTy = dyn_cast<RankedTensorType>(abs.getType());
+  auto angleTy = dyn_cast<RankedTensorType>(angle.getType());
+  if (!absTy || !angleTy)
+    return op.emitError("only ranked tensor type is supported in polar op");
+
+  auto outType =
+      cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+  auto complexTy = dyn_cast<mlir::ComplexType>(outType.getElementType());
+  if (!complexTy)
+    return op.emitError("expected polar to produce a complex tensor");
+
+  // stablehlo.complex only takes f32/f64 operands, which lines up with
+  // aten.polar requiring abs and angle to be float or double.
+  Type elemTy = complexTy.getElementType();
+  if (!elemTy.isF32() && !elemTy.isF64())
+    return op.emitError("only complex<f32> and complex<f64> results are "
+                        "supported in polar op");
+
+  // aten.polar's shape function is unary(abs), so abs, angle and the result
+  // all share a shape. Multiplying with chlo.broadcast_multiply instead would
+  // emit a shape.assuming + stablehlo.dynamic_broadcast_in_dim pair that the
+  // stablehlo-to-linalg conversion leaves behind, failing bufferization.
+  if (absTy.getShape() != outType.getShape() ||
+      angleTy.getShape() != outType.getShape())
+    return op.emitError(
+        "expected abs, angle and the result to have the same shape");
+
+  abs = hlo::promoteType(rewriter, loc, abs, elemTy);
+  angle = hlo::promoteType(rewriter, loc, angle, elemTy);
+
+  auto partTy = RankedTensorType::get(outType.getShape(), elemTy);
+  Value cos = stablehlo::CosineOp::create(rewriter, loc, partTy, angle);
+  Value sin = stablehlo::SineOp::create(rewriter, loc, partTy, angle);
+  Value real = stablehlo::MulOp::create(rewriter, loc, partTy, abs, cos);
+  Value imag = stablehlo::MulOp::create(rewriter, loc, partTy, abs, sin);
+
+  rewriter.replaceOpWithNewOp<stablehlo::ComplexOp>(op, outType, real, imag);
   return success();
 }
 
@@ -1074,7 +1135,8 @@ LogicalResult ConvertAtenOp<AtenGeluOp>::matchAndRewrite(
   Value three = hlo::getConstantLike(rewriter, loc, 3.0, input);
   Value half = hlo::getConstantLike(rewriter, loc, 0.5, input);
   // 2/pi
-  Value twoDivPi = hlo::getConstantLike(rewriter, loc, M_2_PI, input);
+  Value twoDivPi =
+      hlo::getConstantLike(rewriter, loc, 2.0 / llvm::numbers::pi, input);
   Value t = hlo::getConstantLike(rewriter, loc, 0.044715, input);
 
   // x * 0.5
@@ -1607,7 +1669,8 @@ LogicalResult ConvertAtenOp<AtenClampOp>::matchAndRewrite(
   } else if (failed(checkNotNone(rewriter, op, minValue))) {
     maxValue =
         hlo::scalarToStablehloTensor(rewriter, op, maxValue, inputElemType);
-    auto minInfo = getMinValueOfDtype(op, inputElemType, rewriter);
+    auto minInfo = getMinValueOfDtype(op, inputElemType, rewriter,
+                                      options.allowNonFinites);
     if (failed(minInfo)) {
       return rewriter.notifyMatchFailure(
           op, "failed to generate min value of dtype");
@@ -1616,7 +1679,8 @@ LogicalResult ConvertAtenOp<AtenClampOp>::matchAndRewrite(
   } else if (failed(checkNotNone(rewriter, op, maxValue))) {
     minValue =
         hlo::scalarToStablehloTensor(rewriter, op, minValue, inputElemType);
-    auto maxInfo = getMaxValueOfDtype(op, inputElemType, rewriter);
+    auto maxInfo = getMaxValueOfDtype(op, inputElemType, rewriter,
+                                      options.allowNonFinites);
     if (failed(maxInfo)) {
       return rewriter.notifyMatchFailure(
           op, "failed to generate max value of dtype");
@@ -1649,14 +1713,16 @@ LogicalResult ConvertAtenOp<AtenClampTensorOp>::matchAndRewrite(
     return rewriter.notifyMatchFailure(
         op, "this op should be folded as its `min` and `max` both are none");
   } else if (failed(minIsNotNone)) {
-    auto minInfo = getMinValueOfDtype(op, inputElemType, rewriter);
+    auto minInfo = getMinValueOfDtype(op, inputElemType, rewriter,
+                                      options.allowNonFinites);
     if (failed(minInfo)) {
       return rewriter.notifyMatchFailure(
           op, "failed to generate min value of dtype");
     }
     minValue = *minInfo;
   } else if (failed(maxIsNotNone)) {
-    auto maxInfo = getMaxValueOfDtype(op, inputElemType, rewriter);
+    auto maxInfo = getMaxValueOfDtype(op, inputElemType, rewriter,
+                                      options.allowNonFinites);
     if (failed(maxInfo)) {
       return rewriter.notifyMatchFailure(
           op, "failed to generate max value of dtype");
@@ -2093,14 +2159,12 @@ LogicalResult ConvertAtenOp<AtenBitwiseRightShiftTensorOp>::matchAndRewrite(
   return success();
 }
 
-template <>
-LogicalResult ConvertAtenOp<AtenTrilOp>::matchAndRewrite(
-    AtenTrilOp op, OpAdaptor adaptor,
-    ConversionPatternRewriter &rewriter) const {
-
+template <typename AtenOpT>
+LogicalResult convertTrilOrTriu(AtenOpT op, Value self, Value diagonal,
+                                stablehlo::ComparisonDirection dir,
+                                const TypeConverter *typeConverter,
+                                ConversionPatternRewriter &rewriter) {
   Location loc = op.getLoc();
-
-  Value self = adaptor.getSelf();
 
   auto selfTy = cast<RankedTensorType>(self.getType());
   if (!selfTy.hasStaticShape()) {
@@ -2117,7 +2181,6 @@ LogicalResult ConvertAtenOp<AtenTrilOp>::matchAndRewrite(
   Value rowIdxTensor =
       stablehlo::IotaOp::create(rewriter, loc, iotaTy, 0).getResult();
 
-  Value diagonal = adaptor.getDiagonal();
   Value diagonalTensor =
       tensor::FromElementsOp::create(rewriter, loc, diagonal).getResult();
 
@@ -2125,8 +2188,8 @@ LogicalResult ConvertAtenOp<AtenTrilOp>::matchAndRewrite(
   Value shiftedRowIdxTensor = chlo::BroadcastAddOp::create(
       rewriter, loc, rowIdxTensor, diagonalTensor, bcastDimensions);
 
-  auto cmpDirectionAttr = stablehlo::ComparisonDirectionAttr::get(
-      rewriter.getContext(), stablehlo::ComparisonDirection::LE);
+  auto cmpDirectionAttr =
+      stablehlo::ComparisonDirectionAttr::get(rewriter.getContext(), dir);
   auto cmpTypeAttr = stablehlo::ComparisonTypeAttr::get(
       rewriter.getContext(), stablehlo::ComparisonType::SIGNED);
   auto cmpTy = iotaTy.clone(rewriter.getI1Type());
@@ -2134,8 +2197,7 @@ LogicalResult ConvertAtenOp<AtenTrilOp>::matchAndRewrite(
                                               colIdxTensor, shiftedRowIdxTensor,
                                               cmpDirectionAttr, cmpTypeAttr);
 
-  auto resTy =
-      cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+  auto resTy = cast<RankedTensorType>(typeConverter->convertType(op.getType()));
 
   auto bcastTy = resTy.clone(rewriter.getI1Type());
   auto bcastAttr = rewriter.getDenseI64ArrayAttr({selfRank - 2, selfRank - 1});
@@ -2146,8 +2208,9 @@ LogicalResult ConvertAtenOp<AtenTrilOp>::matchAndRewrite(
   Value zeroTensor;
   if (isa<mlir::FloatType>(resElemTy)) {
     auto constAttr = SplatElementsAttr::get(
-        resTy, llvm::APFloat::getZero(
-                   cast<FloatType>(resElemTy).getFloatSemantics(), false));
+        resTy,
+        llvm::APFloat::getZero(
+            cast<mlir::FloatType>(resElemTy).getFloatSemantics(), false));
     zeroTensor = stablehlo::ConstantOp::create(rewriter, loc, resTy, constAttr);
   } else if (isa<mlir::IntegerType>(resElemTy)) {
     auto constAttr = SplatElementsAttr::get(
@@ -2155,13 +2218,31 @@ LogicalResult ConvertAtenOp<AtenTrilOp>::matchAndRewrite(
         llvm::APInt::getZero(cast<mlir::IntegerType>(resElemTy).getWidth()));
     zeroTensor = stablehlo::ConstantOp::create(rewriter, loc, resTy, constAttr);
   } else {
-    return op.emitError("element type is not float or integer");
+    return op->emitError("element type is not float or integer");
   }
 
   rewriter.replaceOpWithNewOp<stablehlo::SelectOp>(
       op.getOperation(), resTy, bcastedCmpRes, self, zeroTensor);
 
   return success();
+}
+
+template <>
+LogicalResult ConvertAtenOp<AtenTrilOp>::matchAndRewrite(
+    AtenTrilOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  return convertTrilOrTriu(op, adaptor.getSelf(), adaptor.getDiagonal(),
+                           stablehlo::ComparisonDirection::LE,
+                           getTypeConverter(), rewriter);
+}
+
+template <>
+LogicalResult ConvertAtenOp<AtenTriuOp>::matchAndRewrite(
+    AtenTriuOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  return convertTrilOrTriu(op, adaptor.getSelf(), adaptor.getDiagonal(),
+                           stablehlo::ComparisonDirection::GE,
+                           getTypeConverter(), rewriter);
 }
 
 template <>
@@ -2185,6 +2266,111 @@ LogicalResult ConvertAtenOp<AtenIsfiniteOp>::matchAndRewrite(
   rewriter.replaceOpWithNewOp<stablehlo::IsFiniteOp>(op.getOperation(), outType,
                                                      self);
 
+  return success();
+}
+
+// AtenSortOp
+template <>
+LogicalResult ConvertAtenOp<AtenSortOp>::matchAndRewrite(
+    AtenSortOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  Value self = adaptor.getSelf();
+  auto selfType = dyn_cast<RankedTensorType>(self.getType());
+  if (!selfType)
+    return rewriter.notifyMatchFailure(op, "expected ranked tensor for self");
+
+  // Values and indices return types
+  RankedTensorType valuesType = dyn_cast<RankedTensorType>(
+      getTypeConverter()->convertType(op.getResult(0).getType()));
+  RankedTensorType indicesType = dyn_cast<RankedTensorType>(
+      getTypeConverter()->convertType(op.getResult(1).getType()));
+  if (!valuesType || !indicesType)
+    return rewriter.notifyMatchFailure(op,
+                                       "expected ranked tensor output types");
+
+  Location loc = op.getLoc();
+  Value dimVal = op.getDim();
+  Value descendingVal = op.getDescending();
+
+  int64_t dim;
+  if (auto constantOp = dimVal.getDefiningOp<ConstantIntOp>()) {
+    dim = constantOp.getValueAttr().getInt();
+  } else {
+    return rewriter.notifyMatchFailure(op, "non-constant dim parameter");
+  }
+  int64_t rank = selfType.getRank();
+  if (dim < -rank || dim >= rank) {
+    return rewriter.notifyMatchFailure(op, "dimension out of range");
+  }
+  if (dim < 0) {
+    dim += rank;
+  }
+
+  bool descending;
+  if (auto constantOp = descendingVal.getDefiningOp<ConstantBoolOp>()) {
+    descending = constantOp.getValue();
+  } else {
+    return rewriter.notifyMatchFailure(op, "non-constant descending parameter");
+  }
+
+  // 1. Generate indices tensor using stablehlo.iota
+  Value indices = stablehlo::IotaOp::create(rewriter, loc, indicesType,
+                                            rewriter.getI64IntegerAttr(dim));
+
+  // 2. Create stablehlo.sort op
+  auto sortOp = stablehlo::SortOp::create(
+      rewriter, loc, TypeRange{valuesType, indicesType},
+      ValueRange{self, indices}, rewriter.getI64IntegerAttr(dim),
+      rewriter.getBoolAttr(false));
+
+  // 3. Build comparator block
+  Block &block = sortOp.getComparator().emplaceBlock();
+
+  auto blockValArgumentType =
+      RankedTensorType::get({}, valuesType.getElementType());
+  auto blockIdxArgumentType =
+      RankedTensorType::get({}, indicesType.getElementType());
+
+  block.addArgument(blockValArgumentType, loc);
+  block.addArgument(blockValArgumentType, loc);
+  block.addArgument(blockIdxArgumentType, loc);
+  block.addArgument(blockIdxArgumentType, loc);
+
+  auto *firstValArg = block.args_begin();
+  auto *secondValArg = std::next(firstValArg);
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointToStart(&block);
+
+  auto compareDirectionAttr = stablehlo::ComparisonDirectionAttr::get(
+      rewriter.getContext(), descending ? stablehlo::ComparisonDirection::GT
+                                        : stablehlo::ComparisonDirection::LT);
+
+  stablehlo::ComparisonTypeAttr compareTypeAttr;
+  Type elemTy = valuesType.getElementType();
+
+  if (isa<mlir::FloatType>(valuesType.getElementType())) {
+    compareTypeAttr = stablehlo::ComparisonTypeAttr::get(
+        rewriter.getContext(), stablehlo::ComparisonType::FLOAT);
+  } else if (isa<mlir::IntegerType>(valuesType.getElementType())) {
+    if (elemTy.isInteger(1)) {
+      compareTypeAttr = stablehlo::ComparisonTypeAttr::get(
+          rewriter.getContext(), stablehlo::ComparisonType::UNSIGNED);
+    } else {
+      compareTypeAttr = stablehlo::ComparisonTypeAttr::get(
+          rewriter.getContext(), stablehlo::ComparisonType::SIGNED);
+    }
+  }
+
+  auto compareResultType = RankedTensorType::get({}, rewriter.getI1Type());
+
+  Value compareResult = stablehlo::CompareOp::create(
+      rewriter, loc, compareResultType, *firstValArg, *secondValArg,
+      compareDirectionAttr, compareTypeAttr);
+
+  stablehlo::ReturnOp::create(rewriter, loc, compareResult);
+
+  rewriter.replaceOp(op, sortOp.getResults());
   return success();
 }
 
@@ -2336,6 +2522,7 @@ void mlir::torch::torch_to_stablehlo::populateBasicOpPatternsAndLegality(
   INSERT_ATENOP_PATTERN(AtenReflectionPad1dOp);
 
   INSERT_ATENOP_PATTERN(AtenReluOp);
+  INSERT_ATENOP_PATTERN(AtenPolarOp);
   INSERT_ATENOP_PATTERN(AtenGeluOp);
   INSERT_ATENOP_PATTERN(AtenLog2Op);
   INSERT_ATENOP_PATTERN(AtenLog10Op);
@@ -2363,7 +2550,10 @@ void mlir::torch::torch_to_stablehlo::populateBasicOpPatternsAndLegality(
   INSERT_ATENOP_PATTERN(AtenBitwiseRightShiftTensorOp);
 
   INSERT_ATENOP_PATTERN(AtenTrilOp);
+  INSERT_ATENOP_PATTERN(AtenTriuOp);
   INSERT_ATENOP_PATTERN(AtenIsfiniteOp);
+  INSERT_ATENOP_PATTERN(AtenSortOp);
+
 #undef INSERT_ATENOP_PATTERN
 
 #define INSERT_BINARY_BROADCAST_PATTERN(AtenOp, StablehloOp)                   \

@@ -21,7 +21,7 @@ from lit.llvm.subst import FindTool
 # name: The name of this test suite.
 config.name = "TORCH_MLIR"
 
-config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
+config.test_format = lit.formats.ShTest()
 
 # suffixes: A list of file extensions to treat as test files.
 config.suffixes = [".mlir", ".py", ".runlit"]
@@ -34,6 +34,11 @@ config.test_exec_root = os.path.join(config.torch_mlir_obj_root, "test")
 
 config.substitutions.append(("%PATH%", config.environment["PATH"]))
 config.substitutions.append(("%shlibext", config.llvm_shlib_ext))
+
+# Register optional-backend availability as lit features so tests that exercise a
+# specific backend contract can guard themselves with `// REQUIRES: <backend>`.
+if getattr(config, "enable_stablehlo", False):
+    config.available_features.add("stablehlo")
 
 llvm_config.with_system_environment(["HOME", "INCLUDE", "LIB", "TMP", "TEMP"])
 

@@ -20,7 +20,7 @@ func.func @torch.aten.mul.Scalar$mixed_type(%arg0: !torch.vtensor<[5],bf16>) -> 
 // CHECK-SAME: %[[VAL_1:.*]]: tensor<6xf32>
 // CHECK: %[[VAL_3:.*]] = tosa.cast %[[VAL_1]] : (tensor<6xf32>) -> tensor<6xbf16>
 // CHECK: %[[VAL_4:.*]] = tosa.add %[[VAL_0]], %[[VAL_3]] : (tensor<6xbf16>, tensor<6xbf16>) -> tensor<6xbf16>
-func.func @torch.aten.add.Tensor$mixed_type_fp(%arg0: !torch.vtensor<[6],bf16>, %arg1: !torch.vtensor<[6],f32>, %arg2: !torch.float) -> !torch.vtensor<[6],bf16> {
+func.func @torch.aten.add.Tensor$mixed_type_fp(%arg0: !torch.vtensor<[6],bf16>, %arg1: !torch.vtensor<[6],f32>) -> !torch.vtensor<[6],bf16> {
   %float1 = torch.constant.float 1.000000e+00
   %0 = torch.aten.add.Tensor %arg0, %arg1, %float1 : !torch.vtensor<[6],bf16>, !torch.vtensor<[6],f32>, !torch.float -> !torch.vtensor<[6],bf16>
   return %0 : !torch.vtensor<[6],bf16>
@@ -87,6 +87,17 @@ func.func @torch.aten.maximum$mixed_type(%arg0: !torch.vtensor<[1,3,1],si32>, %a
 func.func @torch.aten.bitwise_and.Tensor$mixed_type(%arg0: !torch.vtensor<[?,?],si16>, %arg1: !torch.vtensor<[?,?],si32>) -> !torch.vtensor<[?,?],si32> {
   %0 = torch.aten.bitwise_and.Tensor %arg0, %arg1 : !torch.vtensor<[?,?],si16>, !torch.vtensor<[?,?],si32> -> !torch.vtensor<[?,?],si32>
   return %0 : !torch.vtensor<[?,?],si32>
+}
+
+// -----
+
+// CHECK-LABEL: torch.aten.bitwise_xor.Tensor$bool
+// CHECK-SAME: %[[VAL_0:.*]]: tensor<?x?xi1>,
+// CHECK-SAME: %[[VAL_1:.*]]: tensor<?x?xi1>
+// CHECK: %[[VAL_2:.*]] = tosa.logical_xor %[[VAL_0]], %[[VAL_1]] : (tensor<?x?xi1>, tensor<?x?xi1>) -> tensor<?x?xi1>
+func.func @torch.aten.bitwise_xor.Tensor$bool(%arg0: !torch.vtensor<[?,?],i1>, %arg1: !torch.vtensor<[?,?],i1>) -> !torch.vtensor<[?,?],i1> {
+  %0 = torch.aten.bitwise_xor.Tensor %arg0, %arg1 : !torch.vtensor<[?,?],i1>, !torch.vtensor<[?,?],i1> -> !torch.vtensor<[?,?],i1>
+  return %0 : !torch.vtensor<[?,?],i1>
 }
 
 // -----

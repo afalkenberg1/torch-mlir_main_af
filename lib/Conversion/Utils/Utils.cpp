@@ -134,11 +134,18 @@ Value createZeroInitTensor(OpBuilder &b, Location loc, ValueRange sizes,
   Value initTensor =
       tensor::EmptyOp::create(b, loc, getAsOpFoldResult(sizes), elemTy);
 
-  Type fillValElemTy = elemTy;
-  if (auto dtypeComplex = dyn_cast<mlir::ComplexType>(elemTy))
-    fillValElemTy = cast<mlir::FloatType>(dtypeComplex.getElementType());
-
-  Value c0 = arith::ConstantOp::create(b, loc, b.getZeroAttr(fillValElemTy));
+  Value c0;
+  if (auto dtypeComplex = dyn_cast<mlir::ComplexType>(elemTy)) {
+    // For complex types, create a complex zero (0.0 + 0.0j)
+    Type floatType = cast<mlir::FloatType>(dtypeComplex.getElementType());
+    Value realZero =
+        arith::ConstantOp::create(b, loc, b.getZeroAttr(floatType));
+    Value imagZero =
+        arith::ConstantOp::create(b, loc, b.getZeroAttr(floatType));
+    c0 = complex::CreateOp::create(b, loc, elemTy, realZero, imagZero);
+  } else {
+    c0 = arith::ConstantOp::create(b, loc, b.getZeroAttr(elemTy));
+  }
   return linalg::FillOp::create(b, loc, c0, initTensor).getResult(0);
 }
 
@@ -147,11 +154,17 @@ Value createOneInitTensor(OpBuilder &b, Location loc, ValueRange sizes,
   Value initTensor =
       tensor::EmptyOp::create(b, loc, getAsOpFoldResult(sizes), elemTy);
 
-  Type fillValElemTy = elemTy;
-  if (auto dtypeComplex = dyn_cast<mlir::ComplexType>(elemTy))
-    fillValElemTy = cast<mlir::FloatType>(dtypeComplex.getElementType());
-
-  Value c1 = arith::ConstantOp::create(b, loc, b.getOneAttr(fillValElemTy));
+  Value c1;
+  if (auto dtypeComplex = dyn_cast<mlir::ComplexType>(elemTy)) {
+    // For complex types, create a complex one (1.0 + 0.0j)
+    Type floatType = cast<mlir::FloatType>(dtypeComplex.getElementType());
+    Value realOne = arith::ConstantOp::create(b, loc, b.getOneAttr(floatType));
+    Value imagZero =
+        arith::ConstantOp::create(b, loc, b.getZeroAttr(floatType));
+    c1 = complex::CreateOp::create(b, loc, elemTy, realOne, imagZero);
+  } else {
+    c1 = arith::ConstantOp::create(b, loc, b.getOneAttr(elemTy));
+  }
   return linalg::FillOp::create(b, loc, c1, initTensor).getResult(0);
 }
 
@@ -429,6 +442,18 @@ Value convertScalarToDtype(OpBuilder &b, Location loc, Value scalar, Type dtype,
   llvm_unreachable("convertScalarToDtype should handle all the types");
 }
 
+Value materializeScalarToDtype(OpBuilder &b, Location loc,
+                               const TypeConverter *converter, Value scalar,
+                               Type dtype, Type srcOriginalDtype) {
+  Type convertedType = converter->convertType(scalar.getType());
+  if (scalar.getType() != convertedType)
+    scalar =
+        converter->materializeTargetConversion(b, loc, convertedType, scalar);
+  return convertScalarToDtype(
+      b, loc, scalar, dtype,
+      srcOriginalDtype ? std::optional<Type>(srcOriginalDtype) : std::nullopt);
+}
+
 Value toPositiveValidDim(ConversionPatternRewriter &rewriter, Location loc,
                          Value torchOptionalInt, Value builtinInt,
                          Value defaultValue, Value dimSize) {
@@ -606,6 +631,41 @@ LogicalResult getQuantizationParams(Value value, Value &zeropoint, Value &scale,
       .Case<AtenQuantizePerTensorOp>(setParams)
       .Case<Aten_MakePerChannelQuantizedTensorOp>(setParams)
       .Default([](auto) { return failure(); });
+}
+
+LogicalResult
+getConstantPerTensorQParams(PatternRewriter &rewriter, Operation *op,
+                            Value scale, Value zeroPoint, Value quantMin,
+                            Value quantMax, bool requireNonZeroScale,
+                            bool requireClampRange, PerTensorQParams &qparams) {
+  if (!matchPattern(scale, m_TorchConstantFloat(&qparams.scale)))
+    return rewriter.notifyMatchFailure(
+        op, "dynamic per-tensor scale not supported; scale must be a constant");
+  if (requireNonZeroScale && qparams.scale == 0.0)
+    return rewriter.notifyMatchFailure(op, "scale must be non-zero");
+
+  if (!matchPattern(zeroPoint, m_TorchConstantInt(&qparams.zeroPoint)))
+    return rewriter.notifyMatchFailure(
+        op, "dynamic per-tensor zero_point not supported; zero_point must be a "
+            "constant");
+
+  if (requireClampRange) {
+    if (!matchPattern(quantMin, m_TorchConstantInt(&qparams.quantMin)))
+      return rewriter.notifyMatchFailure(
+          op, "dynamic per-tensor quant_min not supported");
+    if (!matchPattern(quantMax, m_TorchConstantInt(&qparams.quantMax)))
+      return rewriter.notifyMatchFailure(
+          op, "dynamic per-tensor quant_max not supported");
+  }
+
+  return success();
+}
+
+APFloat getFloatInf(mlir::FloatType fpType, bool negative,
+                    bool allowNonFinites) {
+  return allowNonFinites
+             ? APFloat::getInf(fpType.getFloatSemantics(), negative)
+             : APFloat::getLargest(fpType.getFloatSemantics(), negative);
 }
 
 } // namespace Torch

@@ -35,6 +35,7 @@ declare_mlir_python_sources(TorchMLIRPythonSources.Importers
   ROOT_DIR "${TORCH_MLIR_PYTHON_ROOT_DIR}"
   ADD_TO_PARENT TorchMLIRPythonSources
   SOURCES
+    extras/fx_as_strided.py
     extras/fx_importer.py
     extras/onnx_importer.py
 )
@@ -126,3 +127,10 @@ add_mlir_python_modules(TorchMLIRPythonModules
 )
 
 add_dependencies(TorchMLIRPythonModules torch-mlir-opt)
+
+# Some optional PyTorch-extension backed modules are built outside of the
+# AddMLIRPython `declare_mlir_python_extension()` flow, but are still expected to
+# be present in the python package when enabled.
+if(TORCH_MLIR_ENABLE_JIT_IR_IMPORTER)
+  add_dependencies(TorchMLIRPythonModules TorchMLIRJITIRImporterPybind)
+endif()

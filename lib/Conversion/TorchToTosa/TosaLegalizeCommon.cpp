@@ -10,8 +10,10 @@
 #include "torch-mlir/Conversion/TorchToTosa/TosaLegalizeCommon.h"
 #include "mlir/Dialect/Tosa/IR/TosaOps.h" // from @llvm-project
 #include "mlir/Dialect/Tosa/Utils/ConversionUtils.h"
+#include "torch-mlir/Conversion/TorchToTosa/TosaLegalizeUtils.h"
 #include "torch-mlir/Conversion/Utils/Utils.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
+#include "torch-mlir/Dialect/Torch/Utils/Utils.h"
 
 #include <cstdint>
 #include <iterator>
@@ -420,18 +422,16 @@ std::optional<Value> convertGatherNdOp(PatternRewriter &rewriter, Operation *op,
   // Now the gather op itself
   // %9 = "tosa.gather"(%2, %7) : (tensor<1x12x1xf32>, tensor<1x8xi32>) ->
   // tensor<1x8x1xf32>
-  auto tosaGatherOp = tosa::CreateOpAndInfer<tosa::GatherOp>(
-      rewriter, op->getLoc(),
-      GetTypeFromTensorShape(tosaGatherResultShape,
-                             resultType.getElementType()),
-      tosaValuesReshapeOp.getResult(), tosaIndicesReshapeOp.getResult());
+  auto gatherTy = GetTypeFromTensorShape(tosaGatherResultShape,
+                                         resultType.getElementType());
+  auto gatherResult = tosa::createGatherOp(rewriter, op->getLoc(), gatherTy,
+                                           tosaValuesReshapeOp.getResult(),
+                                           tosaIndicesReshapeOp.getResult());
+  if (!gatherResult)
+    return std::nullopt;
 
-  // Finally, reshape back to the original output shape of [Indices,
-  // ParamChannels]. %10 = "tosa.reshape"(%9) {new_shape = [1, 4, 2]} :
-  // (tensor<1x8x1xf32>) -> tensor<1x4x2xf32> %11 = torch_c.from_builtin_tensor
-  // %10 : tensor<1x4x2xf32> -> !torch.vtensor<[1,4,2],f32>
   return tosa::CreateOpAndInfer<tosa::ReshapeOp>(
-             rewriter, op->getLoc(), resultType, tosaGatherOp.getResult(),
+             rewriter, op->getLoc(), resultType, *gatherResult,
              tosa::getTosaConstShape(rewriter, op->getLoc(),
                                      resultType.getShape()))
       .getResult();
@@ -448,7 +448,7 @@ std::optional<Value> convertScatterNdOp(PatternRewriter &rewriter,
   auto indicesType = dyn_cast<RankedTensorType>(indicesValue.getType());
   auto fillValuesType = dyn_cast<RankedTensorType>(fillValues.getType());
 
-  if (!resultType || !paramsType || !indicesType)
+  if (!resultType || !paramsType || !indicesType || !fillValuesType)
     return std::nullopt;
 
   // N: number of batches
@@ -522,7 +522,7 @@ std::optional<Value> convertScatterNdOp(PatternRewriter &rewriter,
   //    !torch.vtensor<[1,4],si64>
   // Detail algorithm visualization:
 
-  int N = 1, W = 1, K = 1, fillK = 1, C = 1, ND = 1;
+  int N = 1, W = 1, K = 1, C = 1, ND = 1;
 
   int paramsRank = paramsType.getShape().size();   // 2
   int indicesRank = indicesType.getShape().size(); // 2
@@ -553,11 +553,18 @@ std::optional<Value> convertScatterNdOp(PatternRewriter &rewriter,
   // input(chould be scatter) C = product(params.shape[ND:] ND = 2, paramsRank,
   // C = 1
   for (int i = ND; i < paramsRank; i++) {
-    C *= paramsType.getShape()[i];
+    int64_t dim = paramsType.getShape()[i];
+    if (dim < 0) {
+      (void)rewriter.notifyMatchFailure(
+          op, "scatter channel dimensions must be static");
+      return std::nullopt;
+    }
+    C *= dim;
   }
 
   // int N = 1, W = 3, K = 4, fillk = 3, C = 1, ND = 2;
   SmallVector<int64_t, 3> tosaInputValuesShape({N, K, C});     // {1,4,1}
+  SmallVector<int64_t, 3> tosaFillValuesShape({N, W, C});      // {1,3,1}
   SmallVector<int64_t, 2> tosaIndicesShape({N, W});            // {1,3}
   SmallVector<int64_t, 2> indicesMatrixShape({W, ND});         // {3,2}
   SmallVector<int64_t, 2> indicesMatrixReducesumShape({W, 1}); // {3,1}
@@ -569,18 +576,26 @@ std::optional<Value> convertScatterNdOp(PatternRewriter &rewriter,
   // 2. !torch.vtensor<[],si64>
   //    reshape(1) tile(3)  reshape(1,3)   reshape(1,3,1)
   //  [] -> [0] -> [0,0,0] -> [[0,0,0]] -> [[[0], [0], [0]]]
-  //    reshape to [1] and then tile to same number of indicesValue.shape[0],
-  //    [1,1,1]
-  if (fillValuesType.getRank() == 0) {
+  //    reshape to [1] and then tile to W * C update values.
+  if (fillValuesType.getRank() == 0 && C == 0) {
+    auto emptyFillValues = getZerosLikeTensor(
+        rewriter, op,
+        GetTypeFromTensorShape(tosaFillValuesShape,
+                               fillValuesType.getElementType()));
+    if (!emptyFillValues)
+      return std::nullopt;
+    fillValues = *emptyFillValues;
+    fillValuesType = dyn_cast<RankedTensorType>(fillValues.getType());
+  } else if (fillValuesType.getRank() == 0) {
     // [] -> [0]
-    SmallVector<int64_t, 1> oneShape({1}); // {3,1}
+    SmallVector<int64_t, 1> oneShape({1}); // {1}
     auto tosaFillValuesOneReshapeOp = tosa::CreateOpAndInfer<tosa::ReshapeOp>(
         rewriter, op->getLoc(),
         GetTypeFromTensorShape(oneShape, fillValuesType.getElementType()),
         fillValues, tosa::getTosaConstShape(rewriter, op->getLoc(), oneShape));
 
     // [0] -> [0,0,0]
-    SmallVector<int64_t, 1> tileShape({W}); // {3}
+    SmallVector<int64_t, 1> tileShape({W * C}); // {3}
     auto tileOpMultiples =
         tosa::getTosaConstShape(rewriter, op->getLoc(), tileShape);
     auto tosaFillValuesTileOp = tosa::CreateOpAndInfer<tosa::TileOp>(
@@ -589,7 +604,7 @@ std::optional<Value> convertScatterNdOp(PatternRewriter &rewriter,
         tosaFillValuesOneReshapeOp.getResult(), tileOpMultiples);
 
     // [0,0,0] -> [[0,0,0]]
-    SmallVector<int64_t, 2> newTosaFillValuesShape({N, W}); // {1,3}
+    SmallVector<int64_t, 2> newTosaFillValuesShape({N, W * C}); // {1,3}
     auto newTosaFillValuesReshapeOp = tosa::CreateOpAndInfer<tosa::ReshapeOp>(
         rewriter, op->getLoc(),
         GetTypeFromTensorShape(newTosaFillValuesShape,
@@ -601,12 +616,18 @@ std::optional<Value> convertScatterNdOp(PatternRewriter &rewriter,
     fillValuesType = dyn_cast<RankedTensorType>(fillValues.getType());
   }
 
-  // fillK: range of each index, total number of fillInput(could be scatter)
-  // after flattened k = 1*1*3 = 3
-  for (int i = 0; i < ND; i++) {
-    fillK *= fillValuesType.getShape()[i];
+  // TOSA scatter update values are shaped [N, W, C], where W is the
+  // number of flattened scatter indices.
+  int64_t fillNumElements = 1;
+  for (int64_t dim : fillValuesType.getShape()) {
+    fillNumElements *= dim;
   }
-  SmallVector<int64_t, 3> tosaFillValuesShape({N, fillK, C}); // {1,3,1}
+  if (fillNumElements != W * C) {
+    (void)rewriter.notifyMatchFailure(
+        op, "scatter update element count must match flattened indices and "
+            "channels");
+    return std::nullopt;
+  }
 
   // Reshape/Flatten fillValues to 3d tensor
   // [[0,0,0]] -> [[[0], [0], [0]]]
@@ -886,6 +907,55 @@ convertReduceProdOp(PatternRewriter &rewriter, Operation *op,
     return std::nullopt;
   }
 
+  // TOSA does not support integer for REDUCE_PRODUCT. As such, if Prod input is
+  // of int dtype we decompose. Implementation is limited to one reduction axis.
+  if (isa<IntegerType>(input_type.getElementType()) &&
+      axes_elems.getNumElements() == 1) {
+
+    int64_t reduction_axis = axes_elems.getValues<IntegerAttr>()[0].getInt();
+    int64_t reduction_size = input_type.getDimSize(reduction_axis);
+    constexpr int64_t kMaxReductionSize = 16;
+    if (reduction_size <= 0 || reduction_size > kMaxReductionSize)
+      return std::nullopt;
+
+    // Ensure input-/output have the same dtypes
+    auto accumulation_type = input_type.clone(output_type.getElementType());
+    Value casted_input =
+        tosa::tosaCastTensorToType(rewriter, input_value, accumulation_type)
+            .value();
+
+    SmallVector<int64_t> slice_shape(input_type.getShape().begin(),
+                                     input_type.getShape().end());
+    slice_shape[reduction_axis] = 1;
+    auto slice_type =
+        RankedTensorType::get(slice_shape, output_type.getElementType());
+    Value slice_size =
+        tosa::getTosaConstShape(rewriter, op->getLoc(), slice_shape);
+    SmallVector<int64_t> slice_start(input_type.getRank(), 0);
+
+    Value product;
+    for (int64_t index = 0; index < reduction_size; ++index) {
+      slice_start[reduction_axis] = index;
+      Value slice = tosa::SliceOp::create(
+          rewriter, op->getLoc(), slice_type, casted_input,
+          tosa::getTosaConstShape(rewriter, op->getLoc(), slice_start),
+          slice_size);
+      if (!product)
+        product = slice;
+      else
+        product = tosa::createMulOpAndCast(rewriter, op, slice_type, product,
+                                           slice, /*shift=*/0)
+                      .getResult();
+    }
+
+    if (!keep_dims)
+      product = tosa::CreateOpAndInfer<tosa::ReshapeOp>(
+          rewriter, op->getLoc(), output_type, product,
+          tosa::getTosaConstShape(rewriter, op->getLoc(),
+                                  output_type.getShape()));
+    return product;
+  }
+
   return convertReduceOpCommon<tosa::ReduceProductOp>(
       rewriter, op, output_type, input_value, axes_elems, keep_dims,
       output_type.getElementType(), false, 1.0f, 0, 1.0f, 0);
@@ -1051,44 +1121,46 @@ convertLinalgVectorNormOp(PatternRewriter &rewriter, Operation *op,
   }
 
   auto linalgVectorNormOp = cast<AtenLinalgVectorNormOp>(op);
-  // TODO: Add support for ord = {0, +inf, -inf}.
-  auto epsilon = 1e-5;
   double ordLiteralFloat = 1.0;
   int64_t ordLiteralInt = 1;
-  Value ordVal;
-  if (matchPattern(linalgVectorNormOp.getOrd(),
-                   torch::Torch::m_TorchConstantFloat(&ordLiteralFloat))) {
-    ordVal = tosa::getConstTensor<float>(rewriter, op,
-                                         {static_cast<float>(ordLiteralFloat)},
-                                         {}, elemType)
-                 .value();
-  } else if (matchPattern(linalgVectorNormOp.getOrd(),
-                          torch::Torch::m_TorchConstantInt(&ordLiteralInt))) {
-    ordVal = tosa::getConstTensor<float>(rewriter, op,
-                                         {static_cast<float>(ordLiteralInt)},
-                                         {}, elemType)
-                 .value();
-  } else {
+  bool ordIsFloat =
+      matchPattern(linalgVectorNormOp.getOrd(),
+                   torch::Torch::m_TorchConstantFloat(&ordLiteralFloat));
+  bool ordIsInt =
+      !ordIsFloat &&
+      matchPattern(linalgVectorNormOp.getOrd(),
+                   torch::Torch::m_TorchConstantInt(&ordLiteralInt));
+  if (!ordIsFloat && !ordIsInt) {
     op->emitOpError("only support FP or INT type ord parameter");
     return std::nullopt;
   }
 
+  // ord = 0 (count of nonzeros) and ord = +/-inf (min/max of absolute values)
+  // are handled by DecomposeAtenLinalgVectorNormOp; the generic
+  // (sum |x|^ord)^(1/ord) lowering below is undefined for them. Decline before
+  // creating any IR so that a miscompile cannot slip through if decomposition
+  // is disabled.
+  double ordLiteral =
+      ordIsFloat ? ordLiteralFloat : static_cast<double>(ordLiteralInt);
+  if (ordLiteral == 0.0) {
+    (void)rewriter.notifyMatchFailure(op,
+                                      "ord = 0 is handled by decomposition");
+    return std::nullopt;
+  }
+  if (std::isinf(ordLiteral)) {
+    (void)rewriter.notifyMatchFailure(
+        op, "ord = +/-inf are handled by decomposition");
+    return std::nullopt;
+  }
+
+  Value ordVal = tosa::getConstTensor<float>(rewriter, op,
+                                             {static_cast<float>(ordLiteral)},
+                                             {}, elemType)
+                     .value();
   Value ordValRank0 = ordVal;
   if (mlir::tosa::EqualizeRanks(rewriter, op->getLoc(), input_value, ordVal)
           .failed())
     return std::nullopt;
-
-  if (fabs(ordLiteralFloat) < epsilon ||
-      fabs(static_cast<double>(ordLiteralInt)) < epsilon) {
-    op->emitOpError("unimplemented: L0 norm");
-    return std::nullopt;
-  }
-
-  if (std::isinf(ordLiteralFloat) ||
-      std::isinf(static_cast<double>(ordLiteralInt))) {
-    op->emitOpError("unimplemented: ord = +/- inf");
-    return std::nullopt;
-  }
 
   auto input_value_casted =
       tosa::tosaCastTensorToType(rewriter, input_value, output_type).value();
@@ -1273,6 +1345,65 @@ std::optional<Value> createRoundHalfToEven(ConversionPatternRewriter &rewriter,
       floorInput.getResult(), ceilInput.getResult());
 
   return selectOp.getResult();
+}
+
+Value convertResizeOp(ConversionPatternRewriter &rewriter, Operation *op,
+                      const TypeConverter *typeConverter, Value input,
+                      RankedTensorType inputTy, RankedTensorType resultTy,
+                      int64_t outputHeight, int64_t outputWidth,
+                      bool alignCorners, tosa::ResizeMode mode) {
+  auto inputShape = inputTy.getShape();
+  auto inputElemTy = inputTy.getElementType();
+
+  // TOSA works in NHWC. Perform the necessary transformations.
+  SmallVector<int32_t> nchwToNhwcDims({0, 2, 3, 1});
+  SmallVector<int64_t> transposedInputShape(
+      {inputShape[0], inputShape[2], inputShape[3], inputShape[1]});
+  auto transposedInputTy = RankedTensorType::get(
+      makeShapeLLVMCompatible(transposedInputShape), inputElemTy);
+  auto transposedInput =
+      tosa::TransposeOp::create(
+          rewriter, op->getLoc(), typeConverter->convertType(transposedInputTy),
+          input, rewriter.getDenseI32ArrayAttr(nchwToNhwcDims))
+          .getResult();
+
+  int inputHeight = transposedInputShape[1];
+  int inputWidth = transposedInputShape[2];
+
+  SmallVector<int64_t> transposedResizedOpShape(
+      {inputShape[0], outputHeight, outputWidth, inputShape[1]});
+  auto transposedResizedOpTy = RankedTensorType::get(
+      makeShapeLLVMCompatible(transposedResizedOpShape), inputElemTy);
+
+  // Formatting snake_case to match TOSA spec names for readability
+  int scale_y_n, scale_y_d, offset_y, border_y;
+  int scale_x_n, scale_x_d, offset_x, border_x;
+
+  computeResizeParams(inputHeight, outputHeight, alignCorners, mode, scale_y_n,
+                      scale_y_d, offset_y, border_y);
+  computeResizeParams(inputWidth, outputWidth, alignCorners, mode, scale_x_n,
+                      scale_x_d, offset_x, border_x);
+
+  auto scale = tosa::getTosaConstShape(
+      rewriter, op->getLoc(), {scale_y_n, scale_y_d, scale_x_n, scale_x_d});
+  auto offset =
+      tosa::getTosaConstShape(rewriter, op->getLoc(), {offset_y, offset_x});
+  auto border =
+      tosa::getTosaConstShape(rewriter, op->getLoc(), {border_y, border_x});
+
+  auto modeAttr = tosa::ResizeModeAttr::get(rewriter.getContext(), mode);
+
+  auto resizeOpResult =
+      tosa::ResizeOp::create(rewriter, op->getLoc(), transposedResizedOpTy,
+                             transposedInput, scale, offset, border, modeAttr)
+          .getResult();
+
+  SmallVector<int32_t> nhwcToNchwDims({0, 3, 1, 2});
+  auto transposedResizedOp = tosa::TransposeOp::create(
+      rewriter, op->getLoc(), typeConverter->convertType(resultTy),
+      resizeOpResult, rewriter.getDenseI32ArrayAttr(nhwcToNchwDims));
+
+  return transposedResizedOp.getResult();
 }
 
 } // namespace tosa

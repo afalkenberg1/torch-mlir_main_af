@@ -966,11 +966,112 @@ func.func @test_averagepool_1d_default(%arg0: !torch.vtensor<[1,3,32],f32>) -> !
 
 // -----
 
+// ceil_mode with count_include_pad == 0: the pad-excluding divisor and ONNX's
+// ceil split are resolved by a ones-mask ratio -- pad the input and a ones mask
+// with the ONNX split pads, pool both (count_include_pad, floor mode), then
+// divide. The full-kernel divisor cancels, leaving the valid-element average.
 // CHECK-LABEL: @test_averagepool_2d_ceil
+// CHECK:         %[[PAD_IN:.*]] = torch.aten.constant_pad_nd %arg0, %{{.*}}, %{{.*}} : !torch.vtensor<[1,1,4,4],f32>, !torch.list<int>, !torch.float -> !torch.vtensor<[1,1,?,?],f32>
+// CHECK:         %[[ONES:.*]] = torch.aten.ones_like %arg0
+// CHECK:         %[[PAD_ONES:.*]] = torch.aten.constant_pad_nd %[[ONES]], %{{.*}}, %{{.*}}
+// CHECK:         %[[NUM:.*]] = torch.aten.avg_pool2d %[[PAD_IN]], %{{.*}}, %{{.*}}, %{{.*}}, %false, %true, %none
+// CHECK:         %[[DEN:.*]] = torch.aten.avg_pool2d %[[PAD_ONES]], %{{.*}}, %{{.*}}, %{{.*}}, %false, %true, %none
+// CHECK:         torch.aten.div.Tensor %[[NUM]], %[[DEN]]
 func.func @test_averagepool_2d_ceil(%arg0: !torch.vtensor<[1,1,4,4],f32>) -> !torch.vtensor<[1,1,2,2],f32> attributes {torch.onnx_meta.ir_version = 9 : si64, torch.onnx_meta.opset_version = 19 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
-  // CHECK: torch.aten.avg_pool2d %arg0, %0, %2, %1, %true, %false, %none : !torch.vtensor<[1,1,4,4],f32>, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[1,1,2,2],f32>
   %0 = torch.operator "onnx.AveragePool"(%arg0) {torch.onnx.ceil_mode = 1 : si64, torch.onnx.kernel_shape = [3 : si64, 3 : si64], torch.onnx.strides = [2 : si64, 2 : si64]} : (!torch.vtensor<[1,1,4,4],f32>) -> !torch.vtensor<[1,1,2,2],f32>
   return %0 : !torch.vtensor<[1,1,2,2],f32>
+}
+
+// -----
+
+// ONNX ceil_mode grows the output by splitting the extra extent between the
+// leading and trailing edges, which differs from PyTorch's trailing-only ceil.
+// With count_include_pad set, the divisor is the full kernel area, so the ONNX
+// ceil padding is resolved into explicit (asymmetric) pads and the op is lowered
+// as a plain floor-mode pool -- ceil_mode becomes false and the pad list carries
+// the ONNX split (here H: begin 1, end 2; W: begin/end 1).
+// CHECK-LABEL: @test_averagepool_2d_ceil_count_include_pad
+// CHECK:         %[[PAD:.*]] = torch.prim.ListConstruct %int1, %int1{{.*}}, %int2, %int1{{.*}} : (!torch.int, !torch.int, !torch.int, !torch.int) -> !torch.list<int>
+// CHECK:         %[[CEIL:.*]] = torch.constant.bool false
+// CHECK:         %[[CIP:.*]] = torch.constant.bool true
+// CHECK:         torch.aten.avg_pool2d %arg0, %{{.*}}, %{{.*}}, %[[PAD]], %[[CEIL]], %[[CIP]], %none
+func.func @test_averagepool_2d_ceil_count_include_pad(%arg0: !torch.vtensor<[1,2,10,11],f32>) -> !torch.vtensor<[1,2,6,6],f32> attributes {torch.onnx_meta.ir_version = 9 : si64, torch.onnx_meta.opset_version = 19 : si64} {
+  %0 = torch.operator "onnx.AveragePool"(%arg0) {torch.onnx.ceil_mode = 1 : si64, torch.onnx.count_include_pad = 1 : si64, torch.onnx.kernel_shape = [3 : si64, 3 : si64], torch.onnx.pads = [1 : si64, 1 : si64, 1 : si64, 1 : si64], torch.onnx.strides = [2 : si64, 2 : si64]} : (!torch.vtensor<[1,2,10,11],f32>) -> !torch.vtensor<[1,2,6,6],f32>
+  return %0 : !torch.vtensor<[1,2,6,6],f32>
+}
+
+// -----
+
+// Static input but a dynamic result extent: the static "bake the split into the
+// pad attr" path cannot size the split (it would read an unknown result dim), so
+// this must fall through to the runtime `constant_pad_nd` + zero-padded,
+// floor-mode pool path -- the same one used when the input is dynamic. The ONNX
+// split pads are still derived at runtime (size.int / ge / Int.bool / sub), and
+// the pool itself carries zero padding, so the original [1,1] pads must NOT
+// appear as the pool's padding arg on %arg0.
+// The input extent is a compile-time constant here (static input), so the split
+// is derived from constant ints -- but still through the runtime drop logic
+// (ge -> Int.bool -> sub), not the static bake-into-attr path.
+// CHECK-LABEL: @test_averagepool_2d_ceil_count_include_pad_static_in_dynamic_out
+// CHECK:         %[[DROP:.*]] = torch.aten.ge.int %{{.*}}, %{{.*}} : !torch.int, !torch.int -> !torch.bool
+// CHECK:         %[[DROPI:.*]] = torch.aten.Int.bool %[[DROP]]
+// CHECK:         %[[PADDED:.*]] = torch.aten.constant_pad_nd %arg0
+// CHECK:         %[[ZEROPAD:.*]] = torch.prim.ListConstruct %int0{{.*}}, %int0{{.*}} : (!torch.int, !torch.int) -> !torch.list<int>
+// CHECK:         %[[CEIL:.*]] = torch.constant.bool false
+// CHECK:         %[[CIP:.*]] = torch.constant.bool true
+// CHECK:         torch.aten.avg_pool2d %[[PADDED]], %{{.*}}, %{{.*}}, %[[ZEROPAD]], %[[CEIL]], %[[CIP]], %none
+func.func @test_averagepool_2d_ceil_count_include_pad_static_in_dynamic_out(%arg0: !torch.vtensor<[1,2,10,11],f32>) -> !torch.vtensor<[1,2,?,?],f32> attributes {torch.onnx_meta.ir_version = 9 : si64, torch.onnx_meta.opset_version = 19 : si64} {
+  %0 = torch.operator "onnx.AveragePool"(%arg0) {torch.onnx.ceil_mode = 1 : si64, torch.onnx.count_include_pad = 1 : si64, torch.onnx.kernel_shape = [3 : si64, 3 : si64], torch.onnx.pads = [1 : si64, 1 : si64, 1 : si64, 1 : si64], torch.onnx.strides = [2 : si64, 2 : si64]} : (!torch.vtensor<[1,2,10,11],f32>) -> !torch.vtensor<[1,2,?,?],f32>
+  return %0 : !torch.vtensor<[1,2,?,?],f32>
+}
+
+// -----
+
+// Same as above but with a dynamic spatial dim: the ONNX ceil split depends on
+// the runtime extent, so it is materialized as a runtime `constant_pad_nd` in
+// front of a zero-padded, floor-mode pool (count_include_pad keeps the injected
+// zeros in the divisor, reproducing ONNX). The pool itself has zero padding and
+// ceil_mode false.
+// CHECK-LABEL: @test_averagepool_2d_ceil_count_include_pad_dynamic
+// The split pads are derived from the runtime extent, including ONNX's
+// trailing-window drop (ge -> Int.bool -> sub) that a plain ceil-div misses.
+// CHECK:         %[[DIM:.*]] = torch.aten.size.int %arg0
+// CHECK:         %[[DROP:.*]] = torch.aten.ge.int %{{.*}}, %{{.*}} : !torch.int, !torch.int -> !torch.bool
+// CHECK:         %[[DROPI:.*]] = torch.aten.Int.bool %[[DROP]]
+// CHECK:         torch.aten.sub.int %{{.*}}, %[[DROPI]]
+// CHECK:         %[[PADLIST:.*]] = torch.prim.ListConstruct %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : (!torch.int, !torch.int, !torch.int, !torch.int) -> !torch.list<int>
+// CHECK:         %[[PADVAL:.*]] = torch.constant.float 0.000000e+00
+// CHECK:         %[[PADDED:.*]] = torch.aten.constant_pad_nd %arg0, %[[PADLIST]], %[[PADVAL]]
+// CHECK:         %[[ZEROPAD:.*]] = torch.prim.ListConstruct %int0{{.*}}, %int0{{.*}} : (!torch.int, !torch.int) -> !torch.list<int>
+// CHECK:         %[[CEIL:.*]] = torch.constant.bool false
+// CHECK:         %[[CIP:.*]] = torch.constant.bool true
+// CHECK:         torch.aten.avg_pool2d %[[PADDED]], %{{.*}}, %{{.*}}, %[[ZEROPAD]], %[[CEIL]], %[[CIP]], %none
+func.func @test_averagepool_2d_ceil_count_include_pad_dynamic(%arg0: !torch.vtensor<[1,2,?,?],f32>) -> !torch.vtensor<[1,2,?,?],f32> attributes {torch.onnx_meta.ir_version = 9 : si64, torch.onnx_meta.opset_version = 19 : si64} {
+  %0 = torch.operator "onnx.AveragePool"(%arg0) {torch.onnx.ceil_mode = 1 : si64, torch.onnx.count_include_pad = 1 : si64, torch.onnx.kernel_shape = [3 : si64, 3 : si64], torch.onnx.pads = [1 : si64, 1 : si64, 1 : si64, 1 : si64], torch.onnx.strides = [2 : si64, 2 : si64]} : (!torch.vtensor<[1,2,?,?],f32>) -> !torch.vtensor<[1,2,?,?],f32>
+  return %0 : !torch.vtensor<[1,2,?,?],f32>
+}
+
+// -----
+
+// count_include_pad == 0 with a dynamic spatial dim: same ones-mask ratio, but
+// the ONNX split pads are computed with runtime integer arithmetic from the
+// input extent before feeding the two pooled branches.
+// CHECK-LABEL: @test_averagepool_2d_ceil_no_count_include_pad_dynamic
+// The split pads are derived from the runtime extent, including ONNX's
+// trailing-window drop (ge -> Int.bool -> sub) that a plain ceil-div misses.
+// CHECK:         %[[DIM:.*]] = torch.aten.size.int %arg0
+// CHECK:         %[[DROP:.*]] = torch.aten.ge.int %{{.*}}, %{{.*}} : !torch.int, !torch.int -> !torch.bool
+// CHECK:         %[[DROPI:.*]] = torch.aten.Int.bool %[[DROP]]
+// CHECK:         torch.aten.sub.int %{{.*}}, %[[DROPI]]
+// CHECK:         %[[PAD_IN:.*]] = torch.aten.constant_pad_nd %arg0
+// CHECK:         %[[ONES:.*]] = torch.aten.ones_like %arg0
+// CHECK:         %[[PAD_ONES:.*]] = torch.aten.constant_pad_nd %[[ONES]]
+// CHECK:         %[[NUM:.*]] = torch.aten.avg_pool2d %[[PAD_IN]], %{{.*}}, %{{.*}}, %{{.*}}, %false, %true, %none
+// CHECK:         %[[DEN:.*]] = torch.aten.avg_pool2d %[[PAD_ONES]], %{{.*}}, %{{.*}}, %{{.*}}, %false, %true, %none
+// CHECK:         torch.aten.div.Tensor %[[NUM]], %[[DEN]]
+func.func @test_averagepool_2d_ceil_no_count_include_pad_dynamic(%arg0: !torch.vtensor<[1,2,?,?],f32>) -> !torch.vtensor<[1,2,?,?],f32> attributes {torch.onnx_meta.ir_version = 9 : si64, torch.onnx_meta.opset_version = 19 : si64} {
+  %0 = torch.operator "onnx.AveragePool"(%arg0) {torch.onnx.ceil_mode = 1 : si64, torch.onnx.count_include_pad = 0 : si64, torch.onnx.kernel_shape = [3 : si64, 3 : si64], torch.onnx.pads = [1 : si64, 1 : si64, 1 : si64, 1 : si64], torch.onnx.strides = [2 : si64, 2 : si64]} : (!torch.vtensor<[1,2,?,?],f32>) -> !torch.vtensor<[1,2,?,?],f32>
+  return %0 : !torch.vtensor<[1,2,?,?],f32>
 }
 
 // -----
@@ -1217,6 +1318,37 @@ func.func @test_convinteger_without_padding(%arg0: !torch.vtensor<[1,1,3,3],ui8>
 
 // -----
 
+// CHECK-LABEL: @test_convinteger_with_valid_autopad
+func.func @test_convinteger_with_valid_autopad(%arg0: !torch.vtensor<[1,1,3,3],ui8>, %arg1: !torch.vtensor<[1,1,2,2],ui8>, %arg2: !torch.vtensor<[],ui8>, %arg3: !torch.vtensor<[1],ui8>) -> !torch.vtensor<[1,1,2,2],si32> attributes {torch.onnx_meta.ir_version = 5 : si64, torch.onnx_meta.opset_version = 17 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
+  // CHECK: %[[NONE:.*]] = torch.constant.none
+  // CHECK: %[[SCALE:.*]] = torch.constant.float 1.000000e+00
+  // CHECK: %[[INPUT_ZP:.*]] = torch.aten.item %arg2 : !torch.vtensor<[],ui8> -> !torch.int
+  // CHECK: %[[WEIGHT_ZP:.*]] = torch.aten.item %arg3 : !torch.vtensor<[1],ui8> -> !torch.int
+  // CHECK: %[[C0:.*]] = torch.constant.int 0
+  // CHECK: %[[C0_0:.*]] = torch.constant.int 0
+  // CHECK: %[[PADDING:.*]] = torch.prim.ListConstruct %[[C0]], %[[C0_0]] : (!torch.int, !torch.int) -> !torch.list<int>
+  // CHECK: %[[C1_0:.*]] = torch.constant.int 1
+  // CHECK: %[[C1_1:.*]] = torch.constant.int 1
+  // CHECK: %[[DILATIONS:.*]] = torch.prim.ListConstruct %[[C1_0]], %[[C1_1]] : (!torch.int, !torch.int) -> !torch.list<int>
+  // CHECK: %[[C1_2:.*]] = torch.constant.int 1
+  // CHECK: %[[C1_3:.*]] = torch.constant.int 1
+  // CHECK: %[[STRIDE:.*]] = torch.prim.ListConstruct %[[C1_2]], %[[C1_3]] : (!torch.int, !torch.int) -> !torch.list<int>
+  // CHECK: %[[C0_1:.*]] = torch.constant.int 0
+  // CHECK: %[[C0_2:.*]] = torch.constant.int 0
+  // CHECK: %[[OUTPUT_PADDING:.*]] = torch.prim.ListConstruct %[[C0_1]], %[[C0_2]] : (!torch.int, !torch.int) -> !torch.list<int>
+  // CHECK: %[[TRANSPOSED:.*]] = torch.constant.bool false
+  // CHECK: %[[BIAS:.*]] = torch.constant.none
+  // CHECK: %[[GROUPS:.*]] = torch.constant.int 1
+  // CHECK: %[[INPUT:.*]] = torch.aten._make_per_tensor_quantized_tensor %arg0, %[[SCALE]], %[[INPUT_ZP]] : !torch.vtensor<[1,1,3,3],ui8>, !torch.float, !torch.int -> !torch.vtensor<[1,1,3,3],!torch.quint8>
+  // CHECK: %[[WEIGHT:.*]] = torch.aten._make_per_tensor_quantized_tensor %arg1, %[[SCALE]], %[[WEIGHT_ZP]] : !torch.vtensor<[1,1,2,2],ui8>, !torch.float, !torch.int -> !torch.vtensor<[1,1,2,2],!torch.quint8>
+  // CHECK: torch.aten.convolution %[[INPUT]], %[[WEIGHT]], %[[BIAS]], %[[STRIDE]], %[[PADDING]], %[[DILATIONS]], %[[TRANSPOSED]], %[[OUTPUT_PADDING]], %[[GROUPS]] : !torch.vtensor<[1,1,3,3],!torch.quint8>, !torch.vtensor<[1,1,2,2],!torch.quint8>, !torch.none, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.bool, !torch.list<int>, !torch.int -> !torch.vtensor<[1,1,2,2],si32>
+  %none = torch.constant.none
+  %0 = torch.operator "onnx.ConvInteger"(%arg0, %arg1, %arg2, %arg3) {torch.onnx.auto_pad = "VALID"} : (!torch.vtensor<[1,1,3,3],ui8>, !torch.vtensor<[1,1,2,2],ui8>, !torch.vtensor<[],ui8>, !torch.vtensor<[1],ui8>) -> !torch.vtensor<[1,1,2,2],si32>
+  return %0 : !torch.vtensor<[1,1,2,2],si32>
+}
+
+// -----
+
 // CHECK-LABEL: @test_convinteger_with_padding
 func.func @test_convinteger_with_padding(%arg0: !torch.vtensor<[1,1,3,3],ui8>, %arg1: !torch.vtensor<[1,1,2,2],ui8>, %arg2: !torch.vtensor<[],ui8>) -> !torch.vtensor<[1,1,4,4],si32> attributes {torch.onnx_meta.ir_version = 5 : si64, torch.onnx_meta.opset_version = 17 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
   // CHECK: %[[NONE:.*]] = torch.constant.none
@@ -1293,6 +1425,93 @@ func.func @test_convtranspose(%arg0: !torch.vtensor<[1,1,3,3],f32>, %arg1: !torc
   %0 = torch.operator "onnx.ConvTranspose"(%arg0, %arg1) : (!torch.vtensor<[1,1,3,3],f32>, !torch.vtensor<[1,2,3,3],f32>) -> !torch.vtensor<[1,2,5,5],f32>
   return %0 : !torch.vtensor<[1,2,5,5],f32>
 }
+
+// -----
+
+// CHECK-LABEL: @test_convtranspose_output_shape_autopad_valid
+  func.func @test_convtranspose_output_shape_autopad_valid(%arg0: !torch.vtensor<[1,1,3,3],f32>, %arg1: !torch.vtensor<[1,2,4,4],f32>) -> !torch.vtensor<[1,2,9,9],f32> attributes {torch.onnx_meta.ir_version = 10 : si64, torch.onnx_meta.opset_version = 22 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
+    // CHECK: %[[C0:.*]] = torch.constant.int 0
+    // CHECK: %[[C0_0:.*]] = torch.constant.int 0
+    // CHECK: %[[C1:.*]] = torch.constant.int 1
+    // CHECK: %[[C1_0:.*]] = torch.constant.int 1
+    // CHECK: %[[C2:.*]] = torch.constant.int 2
+    // CHECK: %[[C2_0:.*]] = torch.constant.int 2
+    // CHECK: %[[C1_1:.*]] = torch.constant.int 1
+    // CHECK: %[[C1_2:.*]] = torch.constant.int 1
+    // CHECK: %[[PADDING:.*]] = torch.prim.ListConstruct %[[C0]], %[[C0_0]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[DILATIONS:.*]] = torch.prim.ListConstruct %[[C1]], %[[C1_0]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[STRIDE:.*]] = torch.prim.ListConstruct %[[C2]], %[[C2_0]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[OUTPUT_PADDING:.*]] = torch.prim.ListConstruct %[[C1_1]], %[[C1_2]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: torch.aten.convolution %arg0, %arg1, {{.*}}, %[[STRIDE]], %[[PADDING]], %[[DILATIONS]], {{.*}}, %[[OUTPUT_PADDING]], {{.*}} -> !torch.vtensor<[1,2,9,9],f32>
+    %0 = torch.operator "onnx.ConvTranspose"(%arg0, %arg1) {torch.onnx.auto_pad="VALID", torch.onnx.output_shape = [9 : si64, 9 : si64], torch.onnx.strides = [2 : si64, 2 : si64]} : (!torch.vtensor<[1,1,3,3],f32>, !torch.vtensor<[1,2,4,4],f32>) -> !torch.vtensor<[1,2,9,9],f32>
+    return %0 : !torch.vtensor<[1,2,9,9],f32>
+  }
+
+// -----
+
+// CHECK-LABEL: @test_convtranspose_output_shape
+  func.func @test_convtranspose_output_shape(%arg0: !torch.vtensor<[1,1,3,3],f32>, %arg1: !torch.vtensor<[1,2,3,3],f32>) -> !torch.vtensor<[1,2,10,8],f32> attributes {torch.onnx_meta.ir_version = 10 : si64, torch.onnx_meta.opset_version = 22 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
+    // CHECK: %[[C0:.*]] = torch.constant.int 0
+    // CHECK: %[[C0_0:.*]] = torch.constant.int 0
+    // CHECK: %[[C1:.*]] = torch.constant.int 1
+    // CHECK: %[[C1_0:.*]] = torch.constant.int 1
+    // CHECK: %[[C3:.*]] = torch.constant.int 3
+    // CHECK: %[[C2:.*]] = torch.constant.int 2
+    // CHECK: %[[C1_1:.*]] = torch.constant.int 1
+    // CHECK: %[[C1_2:.*]] = torch.constant.int 1
+    // CHECK: %[[PADDING:.*]] = torch.prim.ListConstruct %[[C0]], %[[C0_0]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[DILATIONS:.*]] = torch.prim.ListConstruct %[[C1]], %[[C1_0]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[STRIDE:.*]] = torch.prim.ListConstruct %[[C3]], %[[C2]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[OUTPUT_PADDING:.*]] = torch.prim.ListConstruct %[[C1_1]], %[[C1_2]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[TRANSPOSED:.*]] = torch.constant.bool true
+    // CHECK: %[[BIAS:.*]] = torch.constant.none
+    // CHECK: %[[GROUPS:.*]] = torch.constant.int 1
+    // CHECK: torch.aten.convolution %arg0, %arg1, %[[BIAS]], %[[STRIDE]], %[[PADDING]], %[[DILATIONS]], %[[TRANSPOSED]], %[[OUTPUT_PADDING]], %[[GROUPS]] : !torch.vtensor<[1,1,3,3],f32>, !torch.vtensor<[1,2,3,3],f32>, !torch.none, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.bool, !torch.list<int>, !torch.int -> !torch.vtensor<[1,2,10,8],f32>
+    %0 = torch.operator "onnx.ConvTranspose"(%arg0, %arg1) {torch.onnx.output_shape = [10 : si64, 8 : si64], torch.onnx.strides = [3 : si64, 2 : si64]} : (!torch.vtensor<[1,1,3,3],f32>, !torch.vtensor<[1,2,3,3],f32>) -> !torch.vtensor<[1,2,10,8],f32>
+    return %0 : !torch.vtensor<[1,2,10,8],f32>
+  }
+
+// -----
+
+// CHECK-LABEL: @test_convtranspose_output_shape_with_output_padding
+  func.func @test_convtranspose_output_shape_with_output_padding(%arg0: !torch.vtensor<[1,1,3,3],f32>, %arg1: !torch.vtensor<[1,2,3,3],f32>) -> !torch.vtensor<[1,2,10,8],f32> attributes {torch.onnx_meta.ir_version = 10 : si64, torch.onnx_meta.opset_version = 22 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
+    // CHECK: %[[PADV0:.*]] = torch.constant.int 0
+    // CHECK: %[[PADV1:.*]] = torch.constant.int 0
+    // CHECK: %[[DILV0:.*]] = torch.constant.int 1
+    // CHECK: %[[DILV1:.*]] = torch.constant.int 1
+    // CHECK: %[[STRV0:.*]] = torch.constant.int 3
+    // CHECK: %[[STRV1:.*]] = torch.constant.int 2
+    // CHECK: %[[OPADV0:.*]] = torch.constant.int 1
+    // CHECK: %[[OPADV1:.*]] = torch.constant.int 1
+    // CHECK: %[[PADDING:.*]] = torch.prim.ListConstruct %[[PADV0]], %[[PADV1]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[DILATIONS:.*]] = torch.prim.ListConstruct %[[DILV0]], %[[DILV1]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[STRIDE:.*]] = torch.prim.ListConstruct %[[STRV0]], %[[STRV1]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[OUTPUT_PADDING:.*]] = torch.prim.ListConstruct %[[OPADV0]], %[[OPADV1]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: torch.aten.convolution %arg0, %arg1, {{.*}}, %[[STRIDE]], %[[PADDING]], %[[DILATIONS]], {{.*}}, %[[OUTPUT_PADDING]], {{.*}} -> !torch.vtensor<[1,2,10,8],f32>
+    %0 = torch.operator "onnx.ConvTranspose"(%arg0, %arg1) {torch.onnx.output_padding = [1 : si64, 1 : si64], torch.onnx.output_shape = [10 : si64, 8 : si64], torch.onnx.strides = [3 : si64, 2 : si64]} : (!torch.vtensor<[1,1,3,3],f32>, !torch.vtensor<[1,2,3,3],f32>) -> !torch.vtensor<[1,2,10,8],f32>
+    return %0 : !torch.vtensor<[1,2,10,8],f32>
+  }
+
+// -----
+
+// CHECK-LABEL: @test_convtranspose_output_shape_with_pads
+  func.func @test_convtranspose_output_shape_with_pads(%arg0: !torch.vtensor<[1,1,3,3],f32>, %arg1: !torch.vtensor<[1,2,3,3],f32>) -> !torch.vtensor<[1,2,8,5],f32> attributes {torch.onnx_meta.ir_version = 10 : si64, torch.onnx_meta.opset_version = 22 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
+    // CHECK: %[[PADV0:.*]] = torch.constant.int 1
+    // CHECK: %[[PADV1:.*]] = torch.constant.int 1
+    // CHECK: %[[DILV0:.*]] = torch.constant.int 1
+    // CHECK: %[[DILV1:.*]] = torch.constant.int 1
+    // CHECK: %[[STRV0:.*]] = torch.constant.int 3
+    // CHECK: %[[STRV1:.*]] = torch.constant.int 2
+    // CHECK: %[[OPADV0:.*]] = torch.constant.int 1
+    // CHECK: %[[OPADV1:.*]] = torch.constant.int 0
+    // CHECK: %[[PADDING:.*]] = torch.prim.ListConstruct %[[PADV0]], %[[PADV1]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[DILATIONS:.*]] = torch.prim.ListConstruct %[[DILV0]], %[[DILV1]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[STRIDE:.*]] = torch.prim.ListConstruct %[[STRV0]], %[[STRV1]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: %[[OUTPUT_PADDING:.*]] = torch.prim.ListConstruct %[[OPADV0]], %[[OPADV1]] : (!torch.int, !torch.int) -> !torch.list<int>
+    // CHECK: torch.aten.convolution %arg0, %arg1, {{.*}}, %[[STRIDE]], %[[PADDING]], %[[DILATIONS]], {{.*}}, %[[OUTPUT_PADDING]], {{.*}} -> !torch.vtensor<[1,2,8,5],f32>
+    %0 = torch.operator "onnx.ConvTranspose"(%arg0, %arg1) {torch.onnx.output_shape = [8 : si64, 5 : si64], torch.onnx.pads = [1 : si64, 1 : si64, 1 : si64, 1 : si64], torch.onnx.strides = [3 : si64, 2 : si64]} : (!torch.vtensor<[1,1,3,3],f32>, !torch.vtensor<[1,2,3,3],f32>) -> !torch.vtensor<[1,2,8,5],f32>
+    return %0 : !torch.vtensor<[1,2,8,5],f32>
+  }
 
 // -----
 
@@ -2110,8 +2329,9 @@ func.func @test_constant_of_shape_arg_input(%arg0: !torch.vtensor<[2], si64>) ->
   // CHECK: %[[ELE_1:.*]] = torch.aten.item %[[EXTRACT_1]] : !torch.vtensor<[],si64> -> !torch.int
   // CHECK: %[[DIM_LIST:.*]] = torch.prim.ListConstruct %[[ELE_0]], %[[ELE_1]] : (!torch.int, !torch.int) -> !torch.list<int>
   // CHECK: %[[NONE:.*]] = torch.constant.none
+  // CHECK: %[[DTYPE:.*]] = torch.constant.int 6
   // CHECK: %[[FILL_VAL:.*]] = torch.constant.float 0.000000e+00
-  // CHECK: %[[ATEN_FULL:.*]] = torch.aten.full %[[DIM_LIST]], %[[FILL_VAL]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.float, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[?,?],f32>
+  // CHECK: %[[ATEN_FULL:.*]] = torch.aten.full %[[DIM_LIST]], %[[FILL_VAL]], %[[DTYPE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.float, !torch.int, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[?,?],f32>
   %0 = "torch.operator"(%arg0) <{name = "onnx.ConstantOfShape"}> : (!torch.vtensor<[2], si64>) -> !torch.vtensor<[?,?], f32>
   return %0 : !torch.vtensor<[?,?], f32>
 }
@@ -2132,8 +2352,9 @@ func.func @test_constant_of_shape_dense_float_default() -> !torch.vtensor<[2,3,4
   // CHECK: %[[ELE_2:.*]] = torch.aten.item %[[EXTRACT_2]] : !torch.vtensor<[],si64> -> !torch.int
   // CHECK: %[[DIM_LIST:.*]] = torch.prim.ListConstruct %[[ELE_0]], %[[ELE_1]], %[[ELE_2]] : (!torch.int, !torch.int, !torch.int) -> !torch.list<int>
   // CHECK: %[[NONE:.*]] = torch.constant.none
+  // CHECK: %[[DTYPE:.*]] = torch.constant.int 6
   // CHECK: %[[FILL_VAL:.*]] = torch.constant.float 0.000000e+00
-  // CHECK: %[[ATEN_FULL:.*]] = torch.aten.full %[[DIM_LIST]], %[[FILL_VAL]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.float, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3,4],f32>
+  // CHECK: %[[ATEN_FULL:.*]] = torch.aten.full %[[DIM_LIST]], %[[FILL_VAL]], %[[DTYPE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.float, !torch.int, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3,4],f32>
   %cst = torch.vtensor.literal(dense<[2,3,4]> : tensor<3xsi64>) : !torch.vtensor<[3], si64>
   %0 = "torch.operator"(%cst) <{name = "onnx.ConstantOfShape"}> : (!torch.vtensor<[3], si64>) -> !torch.vtensor<[2,3,4], f32>
   return %0 : !torch.vtensor<[2,3,4], f32>
@@ -2156,8 +2377,9 @@ func.func @test_constant_of_shape_dense_float_cst() -> !torch.vtensor<[2,3,4], f
   // CHECK: %[[ELE_2:.*]] = torch.aten.item %[[EXTRACT_2]] : !torch.vtensor<[],si64> -> !torch.int
   // CHECK: %[[DIM_LIST:.*]] = torch.prim.ListConstruct %[[ELE_0]], %[[ELE_1]], %[[ELE_2]] : (!torch.int, !torch.int, !torch.int) -> !torch.list<int>
   // CHECK: %[[NONE:.*]] = torch.constant.none
+  // CHECK: %[[DTYPE:.*]] = torch.constant.int 6
   // CHECK: %[[FILL_VAL:.*]] = torch.constant.float 3.4000000953674316
-  // CHECK: %[[ATEN_FULL:.*]] = torch.aten.full %[[DIM_LIST]], %[[FILL_VAL]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.float, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3,4],f32>
+  // CHECK: %[[ATEN_FULL:.*]] = torch.aten.full %[[DIM_LIST]], %[[FILL_VAL]], %[[DTYPE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.float, !torch.int, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3,4],f32>
   %cst = torch.vtensor.literal(dense<[2,3,4]> : tensor<3xsi64>) : !torch.vtensor<[3], si64>
   %0 = "torch.operator"(%cst) <{name = "onnx.ConstantOfShape"}> {torch.onnx.value = dense<3.4> : tensor<1xf32>}: (!torch.vtensor<[3], si64>) -> !torch.vtensor<[2,3,4], f32>
   return %0 : !torch.vtensor<[2,3,4], f32>
@@ -2180,11 +2402,62 @@ func.func @test_constant_of_shape_dense_int_cst() -> !torch.vtensor<[2,3,4], si6
   // CHECK: %[[ELE_2:.*]] = torch.aten.item %[[EXTRACT_2]] : !torch.vtensor<[],si64> -> !torch.int
   // CHECK: %[[DIM_LIST:.*]] = torch.prim.ListConstruct %[[ELE_0]], %[[ELE_1]], %[[ELE_2]] : (!torch.int, !torch.int, !torch.int) -> !torch.list<int>
   // CHECK: %[[NONE:.*]] = torch.constant.none
+  // CHECK: %[[DTYPE:.*]] = torch.constant.int 4
   // CHECK: %[[FILL_VAL:.*]] = torch.constant.int 3
-  // CHECK: %[[ATEN_FULL:.*]] = torch.aten.full %[[DIM_LIST]], %[[FILL_VAL]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.int, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3,4],si64>
+  // CHECK: %[[ATEN_FULL:.*]] = torch.aten.full %[[DIM_LIST]], %[[FILL_VAL]], %[[DTYPE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.int, !torch.int, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3,4],si64>
   %cst = torch.vtensor.literal(dense<[2,3,4]> : tensor<3xsi64>) : !torch.vtensor<[3], si64>
   %0 = "torch.operator"(%cst) <{name = "onnx.ConstantOfShape"}> {torch.onnx.value = dense<3> : tensor<1xsi64>}: (!torch.vtensor<[3], si64>) -> !torch.vtensor<[2,3,4], si64>
   return %0 : !torch.vtensor<[2,3,4], si64>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @test_constant_of_shape_dense_int32_cst
+func.func @test_constant_of_shape_dense_int32_cst() -> !torch.vtensor<[2,3,4], si32> attributes {torch.onnx_meta.ir_version = 9 : si64, torch.onnx_meta.opset_version = 20 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
+  // CHECK: %[[SHAPE_CST:.*]] = torch.vtensor.literal(dense<[2, 3, 4]> : tensor<3xsi64>) : !torch.vtensor<[3],si64>
+  // CHECK: %[[INT0:.*]] = torch.constant.int 0
+  // CHECK: %[[INT0_0:.*]] = torch.constant.int 0
+  // CHECK: %[[EXTRACT_0:.*]] = torch.aten.select.int %[[SHAPE_CST]], %[[INT0]], %[[INT0_0]] : !torch.vtensor<[3],si64>, !torch.int, !torch.int -> !torch.vtensor<[],si64>
+  // CHECK: %[[ELE_0:.*]] = torch.aten.item %[[EXTRACT_0]] : !torch.vtensor<[],si64> -> !torch.int
+  // CHECK: %[[INT1:.*]] = torch.constant.int 1
+  // CHECK: %[[EXTRACT_1:.*]] = torch.aten.select.int %[[SHAPE_CST]], %[[INT0]], %[[INT1]] : !torch.vtensor<[3],si64>, !torch.int, !torch.int -> !torch.vtensor<[],si64>
+  // CHECK: %[[ELE_1:.*]] = torch.aten.item %[[EXTRACT_1]] : !torch.vtensor<[],si64> -> !torch.int
+  // CHECK: %[[INT2:.*]]  = torch.constant.int 2
+  // CHECK: %[[EXTRACT_2:.*]] = torch.aten.select.int %[[SHAPE_CST]], %[[INT0]], %[[INT2]] : !torch.vtensor<[3],si64>, !torch.int, !torch.int -> !torch.vtensor<[],si64>
+  // CHECK: %[[ELE_2:.*]] = torch.aten.item %[[EXTRACT_2]] : !torch.vtensor<[],si64> -> !torch.int
+  // CHECK: %[[DIM_LIST:.*]] = torch.prim.ListConstruct %[[ELE_0]], %[[ELE_1]], %[[ELE_2]] : (!torch.int, !torch.int, !torch.int) -> !torch.list<int>
+  // CHECK: %[[NONE:.*]] = torch.constant.none
+  // CHECK: %[[DTYPE:.*]] = torch.constant.int 3
+  // CHECK: %[[FILL_VAL:.*]] = torch.constant.int 3
+  // CHECK: %[[ATEN_FULL:.*]] = torch.aten.full %[[DIM_LIST]], %[[FILL_VAL]], %[[DTYPE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.int, !torch.int, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3,4],si32>
+  %cst = torch.vtensor.literal(dense<[2,3,4]> : tensor<3xsi64>) : !torch.vtensor<[3], si64>
+  %0 = "torch.operator"(%cst) <{name = "onnx.ConstantOfShape"}> {torch.onnx.value = dense<3> : tensor<1xsi32>}: (!torch.vtensor<[3], si64>) -> !torch.vtensor<[2,3,4], si32>
+  return %0 : !torch.vtensor<[2,3,4], si32>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @test_constant_of_shape_dense_bf16_cst
+func.func @test_constant_of_shape_dense_bf16_cst() -> !torch.vtensor<[2,3,4], bf16> attributes {torch.onnx_meta.ir_version = 9 : si64, torch.onnx_meta.opset_version = 20 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
+  // CHECK: %[[SHAPE_CST:.*]] = torch.vtensor.literal(dense<[2, 3, 4]> : tensor<3xsi64>) : !torch.vtensor<[3],si64>
+  // CHECK: %[[INT0:.*]] = torch.constant.int 0
+  // CHECK: %[[INT0_0:.*]] = torch.constant.int 0
+  // CHECK: %[[EXTRACT_0:.*]] = torch.aten.select.int %[[SHAPE_CST]], %[[INT0]], %[[INT0_0]] : !torch.vtensor<[3],si64>, !torch.int, !torch.int -> !torch.vtensor<[],si64>
+  // CHECK: %[[ELE_0:.*]] = torch.aten.item %[[EXTRACT_0]] : !torch.vtensor<[],si64> -> !torch.int
+  // CHECK: %[[INT1:.*]] = torch.constant.int 1
+  // CHECK: %[[EXTRACT_1:.*]] = torch.aten.select.int %[[SHAPE_CST]], %[[INT0]], %[[INT1]] : !torch.vtensor<[3],si64>, !torch.int, !torch.int -> !torch.vtensor<[],si64>
+  // CHECK: %[[ELE_1:.*]] = torch.aten.item %[[EXTRACT_1]] : !torch.vtensor<[],si64> -> !torch.int
+  // CHECK: %[[INT2:.*]]  = torch.constant.int 2
+  // CHECK: %[[EXTRACT_2:.*]] = torch.aten.select.int %[[SHAPE_CST]], %[[INT0]], %[[INT2]] : !torch.vtensor<[3],si64>, !torch.int, !torch.int -> !torch.vtensor<[],si64>
+  // CHECK: %[[ELE_2:.*]] = torch.aten.item %[[EXTRACT_2]] : !torch.vtensor<[],si64> -> !torch.int
+  // CHECK: %[[DIM_LIST:.*]] = torch.prim.ListConstruct %[[ELE_0]], %[[ELE_1]], %[[ELE_2]] : (!torch.int, !torch.int, !torch.int) -> !torch.list<int>
+  // CHECK: %[[NONE:.*]] = torch.constant.none
+  // CHECK: %[[DTYPE:.*]] = torch.constant.int 15
+  // CHECK: %[[FILL_VAL:.*]] = torch.constant.float 2.000000e+00
+  // CHECK: %[[ATEN_FULL:.*]] = torch.aten.full %[[DIM_LIST]], %[[FILL_VAL]], %[[DTYPE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.float, !torch.int, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3,4],bf16>
+  %cst = torch.vtensor.literal(dense<[2,3,4]> : tensor<3xsi64>) : !torch.vtensor<[3], si64>
+  %0 = "torch.operator"(%cst) <{name = "onnx.ConstantOfShape"}> {torch.onnx.value = dense<2.000000e+00> : tensor<1xbf16>}: (!torch.vtensor<[3], si64>) -> !torch.vtensor<[2,3,4], bf16>
+  return %0 : !torch.vtensor<[2,3,4], bf16>
 }
 
 // -----

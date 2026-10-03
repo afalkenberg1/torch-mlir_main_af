@@ -507,7 +507,7 @@ def Torch_PrimCallMethodOp : Torch_Op<"prim.CallMethod", []> {
 }
 
 def Torch_PrimLoopOp : Torch_Op<"prim.Loop", [
-  DeclareOpInterfaceMethods<RegionBranchOpInterface, ["getEntrySuccessorOperands"]>]> {
+  DeclareOpInterfaceMethods<RegionBranchOpInterface, ["getEntrySuccessorOperands", "getSuccessorInputs"]>]> {
   let summary = "TorchScript prim::Loop op";
   let description = [{
     This op (together with prim.Loop.condition) define a looping construct
@@ -537,7 +537,7 @@ def Torch_PrimLoopOp : Torch_Op<"prim.Loop", [
 }
 
 def Torch_PrimLoopConditionOp : Torch_Op<"prim.Loop.condition", [
-    DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface>,
+    DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface, ["getMutableSuccessorOperands"]>,
     Terminator,
     HasParent<"::mlir::torch::Torch::PrimLoopOp">]> {
   let summary = "yield-like terminator for torch.prim.Loop";
@@ -559,7 +559,7 @@ def Torch_PrimLoopConditionOp : Torch_Op<"prim.Loop.condition", [
 }
 
 def Torch_PrimIfOp : Torch_Op<"prim.If", [
-  DeclareOpInterfaceMethods<RegionBranchOpInterface>]> {
+  DeclareOpInterfaceMethods<RegionBranchOpInterface, ["getSuccessorInputs"]>]> {
   let summary = "TorchScript prim::If op";
   let description = [{
     This op (together with prim.If.yield) define a conditional control flow
@@ -1183,7 +1183,7 @@ def Torch_RuntimeAssertOp: Torch_Op<"runtime.assert", [
 //===----------------------------------------------------------------------===//
 
 def Torch_ShapeCalculateOp : Torch_Op<"shape.calculate", [
-  DeclareOpInterfaceMethods<RegionBranchOpInterface>]> {
+  DeclareOpInterfaceMethods<RegionBranchOpInterface, ["getSuccessorInputs"]>]> {
   let summary = "Shape calculation encapsulation op";
   let description = [{
     The `torch.shape.calculate` op captures a shape calculation
@@ -1235,7 +1235,7 @@ def Torch_ShapeCalculateYieldOp : Torch_Op<"shape.calculate.yield", [
 }
 
 def Torch_ShapeCalculateYieldShapesOp : Torch_Op<"shape.calculate.yield.shapes", [
-    DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface>,
+    DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface, ["getMutableSuccessorOperands"]>,
     Terminator,
     HasValueSemantics,
     ReadOnly,
@@ -1263,7 +1263,7 @@ def Torch_ShapeCalculateYieldShapesOp : Torch_Op<"shape.calculate.yield.shapes",
 //===----------------------------------------------------------------------===//
 
 def Torch_DtypeCalculateOp : Torch_Op<"dtype.calculate", [
-  DeclareOpInterfaceMethods<RegionBranchOpInterface>]> {
+  DeclareOpInterfaceMethods<RegionBranchOpInterface, ["getSuccessorInputs"]>]> {
   let summary = "Dtype calculation encapsulation op";
   let description = [{
     The `torch.dtype.calculate` op captures a dtype calculation
@@ -1315,7 +1315,7 @@ def Torch_DtypeCalculateYieldOp : Torch_Op<"dtype.calculate.yield", [
 }
 
 def Torch_DtypeCalculateYieldDtypesOp : Torch_Op<"dtype.calculate.yield.dtypes", [
-    DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface>,
+    DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface, ["getMutableSuccessorOperands"]>,
     Terminator,
     HasValueSemantics,
     ReadOnly,
@@ -1440,6 +1440,310 @@ def Torch_OnnxVariantRotaryEmbeddingOp: Torch_Op<"onnx.rotary_embedding", [
     AnyTorchTensorType:$result
   );
   let hasCustomAssemblyFormat = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// FlexAttention operation
+
+// NOTE: This op is manually defined because flex_attention exists in
+// PyTorch's Python API (torch.nn.attention.flex_attention) but is not yet
+// registered in PyTorch's JIT operator registry. The update_torch_ods.sh script
+// validates against the JIT registry, so it cannot auto-generate this op.
+// Once PyTorch adds flex_attention to the JIT registry, this can be moved to
+// the auto-generated section.
+//===----------------------------------------------------------------------===//
+def Torch_HigherOrderFlexAttentionOp : Torch_Op<"hop_flex_attention", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly
+  ]> {
+  let summary = "Computes the flex_attention operation";
+  let description = [{
+    FlexAttention operation with flexible block-sparse attention patterns.
+
+    Args:
+      query: Query tensor [B, H, M, K]
+      key: Key tensor [B, H, N, K]
+      value: Value tensor [B, H, N, Ev]
+      scale: Optional float for scaling attention scores (None means 1/sqrt(head_dim))
+      return_lse: Bool to return log-sum-exp values
+
+    Attributes:
+      enable_gqa: Optional bool metadata indicating lowerings should expand
+        key/value heads to query heads for grouped-query attention. When
+        omitted, lowerings may infer whether grouped-query attention expansion
+        is needed from the query/key/value head dimensions. This is not a
+        PyTorch HOP operand.
+      score_mod_fn: Optional function symbol reference for score modification
+      mask_mod_fn: Optional function symbol reference for mask modification
+
+    # TODO: kernel_options: Dict attributes for performance tuning (block_size, num_warps, etc.)
+
+    Returns:
+      output: Result tensor [B, H, M, Ev]
+      logsumexp: Optional log-sum-exp tensor [B, H, M] (if return_lse=True)
+      max_scores: Optional max-scores tensor [B, H, M] (if return_max_scores=True)
+  }];
+
+  let arguments = (ins
+    AnyTorchTensorType:$query,
+    AnyTorchTensorType:$key,
+    AnyTorchTensorType:$value,
+    AnyTorchOptionalFloatType:$scale,
+    Torch_BoolType:$return_lse,
+    Torch_BoolType:$return_max_scores,
+    OptionalAttr<BoolAttr>:$enable_gqa,
+    OptionalAttr<FlatSymbolRefAttr>:$score_mod_fn,
+    OptionalAttr<FlatSymbolRefAttr>:$mask_mod_fn
+  );
+
+  let results = (outs
+    AnyTorchTensorType:$output,
+    AnyTorchOptionalTensorType:$logsumexp,
+    AnyTorchOptionalTensorType:$max_scores
+  );
+
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDefinition = [{
+    ParseResult HigherOrderFlexAttentionOp::parse(OpAsmParser &parser, OperationState &result) {
+      return parseDefaultTorchOp(parser, result, 6, 3);
+    }
+    void HigherOrderFlexAttentionOp::print(OpAsmPrinter &printer) {
+      printDefaultTorchOp(printer, *this, 6, 3);
+    }
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// PT2E quantization ops
+// Hand-authored for quantized_decomposed ops that appear in PT2E export graphs.
+// These are *not* in the PyTorch JIT registry so they cannot be generated via
+// torch_ods_gen.py; they must be listed here as first-class dialect ops.
+//===----------------------------------------------------------------------===//
+
+def Torch_QuantizedDecomposedQuantizePerTensorOp : Torch_Op<
+    "quantized_decomposed.quantize_per_tensor", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly,
+  ]> {
+  let summary = "PT2E quantize_per_tensor (scalar qparams)";
+  let description = [{
+    Corresponds to `quantized_decomposed::quantize_per_tensor` (the default /
+    scalar-qparams overload, whose schema overload_name is empty) in
+    PT2E-exported graphs.
+
+    Quantizes a floating-point tensor to an integer tensor using per-tensor
+    affine quantization:
+    ```
+    output = clamp(round(input / scale) + zero_point, quant_min, quant_max)
+    ```
+
+    The `dtype` argument encodes the output element type as a `torch.dtype`
+    integer code (e.g. 2 = torch.int8, 0 = torch.uint8).  Output shape is
+    identical to the input shape; the element type is determined at
+    compile-time by dtype refinement or left as an opaque integer tensor.
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$input,
+    Torch_FloatType:$scale,
+    Torch_IntType:$zero_point,
+    Torch_IntType:$quant_min,
+    Torch_IntType:$quant_max,
+    Torch_IntType:$dtype
+  );
+  let results = (outs AnyTorchTensorType:$result);
+  let assemblyFormat = [{
+    $input `,` $scale `,` $zero_point `,` $quant_min `,` $quant_max `,` $dtype
+    attr-dict
+    `:` qualified(type($input)) `,` qualified(type($scale)) `,`
+        qualified(type($zero_point)) `,` qualified(type($quant_min)) `,`
+        qualified(type($quant_max)) `,` qualified(type($dtype))
+    `->` qualified(type($result))
+  }];
+}
+
+def Torch_QuantizedDecomposedDequantizePerTensorOp : Torch_Op<
+    "quantized_decomposed.dequantize_per_tensor", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly,
+  ]> {
+  let summary = "PT2E dequantize_per_tensor (scalar qparams)";
+  let description = [{
+    Corresponds to `quantized_decomposed::dequantize_per_tensor` (the default /
+    scalar-qparams overload, whose schema overload_name is empty) in
+    PT2E-exported graphs.
+
+    Dequantizes an integer tensor back to floating point:
+    ```
+    output = (input - zero_point) * scale
+    ```
+
+    The `dtype` argument encodes the *input* element type as a `torch.dtype`
+    integer code and is used only for range-clamping metadata.  `out_dtype`,
+    when not None, specifies the output element type; otherwise output is
+    `float32`.  Output shape is identical to the input shape.
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$input,
+    Torch_FloatType:$scale,
+    Torch_IntType:$zero_point,
+    Torch_IntType:$quant_min,
+    Torch_IntType:$quant_max,
+    Torch_IntType:$dtype,
+    AnyTorchOptionalIntType:$out_dtype
+  );
+  let results = (outs AnyTorchTensorType:$result);
+  let assemblyFormat = [{
+    $input `,` $scale `,` $zero_point `,` $quant_min `,` $quant_max `,` $dtype `,` $out_dtype
+    attr-dict
+    `:` qualified(type($input)) `,` qualified(type($scale)) `,`
+        qualified(type($zero_point)) `,` qualified(type($quant_min)) `,`
+        qualified(type($quant_max)) `,` qualified(type($dtype)) `,`
+        qualified(type($out_dtype))
+    `->` qualified(type($result))
+  }];
+}
+
+def Torch_QuantizedDecomposedQuantizePerChannelOp : Torch_Op<
+    "quantized_decomposed.quantize_per_channel", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly,
+  ]> {
+  let summary = "PT2E quantize_per_channel";
+  let description = [{
+    Quantizes a floating-point tensor with one affine scale and zero point per
+    channel. `axis` identifies the input dimension indexed by the one
+    dimensional `scales` and `zero_points` tensors.
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$input,
+    AnyTorchTensorType:$scales,
+    AnyTorchTensorType:$zero_points,
+    Torch_IntType:$axis,
+    Torch_IntType:$quant_min,
+    Torch_IntType:$quant_max,
+    Torch_IntType:$dtype
+  );
+  let results = (outs AnyTorchTensorType:$result);
+  let assemblyFormat = [{
+    $input `,` $scales `,` $zero_points `,` $axis `,` $quant_min `,`
+        $quant_max `,` $dtype attr-dict
+    `:` qualified(type($input)) `,` qualified(type($scales)) `,`
+        qualified(type($zero_points)) `,` qualified(type($axis)) `,`
+        qualified(type($quant_min)) `,` qualified(type($quant_max)) `,`
+        qualified(type($dtype))
+    `->` qualified(type($result))
+  }];
+}
+
+def Torch_QuantizedDecomposedDequantizePerChannelOp : Torch_Op<
+    "quantized_decomposed.dequantize_per_channel", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly,
+  ]> {
+  let summary = "PT2E dequantize_per_channel";
+  let description = [{
+    Dequantizes an integer tensor with one scale and optional zero point per
+    channel. A None `zero_points` operand denotes symmetric quantization.
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$input,
+    AnyTorchTensorType:$scales,
+    AnyTorchOptionalTensorType:$zero_points,
+    Torch_IntType:$axis,
+    Torch_IntType:$quant_min,
+    Torch_IntType:$quant_max,
+    Torch_IntType:$dtype,
+    AnyTorchOptionalIntType:$out_dtype
+  );
+  let results = (outs AnyTorchTensorType:$result);
+  let assemblyFormat = [{
+    $input `,` $scales `,` $zero_points `,` $axis `,` $quant_min `,`
+        $quant_max `,` $dtype `,` $out_dtype attr-dict
+    `:` qualified(type($input)) `,` qualified(type($scales)) `,`
+        qualified(type($zero_points)) `,` qualified(type($axis)) `,`
+        qualified(type($quant_min)) `,` qualified(type($quant_max)) `,`
+        qualified(type($dtype)) `,` qualified(type($out_dtype))
+    `->` qualified(type($result))
+  }];
+}
+
+def Torch_QuantizedDecomposedQuantizePerChannelGroupOp : Torch_Op<
+    "quantized_decomposed.quantize_per_channel_group", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly,
+  ]> {
+  let summary = "PT2E quantize_per_channel_group";
+  let description = [{
+    Quantizes a floating-point tensor with per-channel-group affine
+    quantization.
+
+    The input tensor is quantized in groups along the last dimension.
+    `scales` and `zero_points` have shape `[num_channels, num_groups]`
+    where `num_groups = input.shape[-1] / group_size`.
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$input,
+    AnyTorchTensorType:$scales,
+    AnyTorchTensorType:$zero_points,
+    Torch_IntType:$quant_min,
+    Torch_IntType:$quant_max,
+    Torch_IntType:$dtype,
+    Torch_IntType:$group_size
+  );
+  let results = (outs AnyTorchTensorType:$result);
+  let assemblyFormat = [{
+    $input `,` $scales `,` $zero_points `,` $quant_min `,`
+        $quant_max `,` $dtype `,` $group_size attr-dict
+    `:` qualified(type($input)) `,` qualified(type($scales)) `,`
+        qualified(type($zero_points)) `,` qualified(type($quant_min)) `,`
+        qualified(type($quant_max)) `,` qualified(type($dtype)) `,`
+        qualified(type($group_size))
+    `->` qualified(type($result))
+  }];
+}
+
+def Torch_QuantizedDecomposedDequantizePerChannelGroupOp : Torch_Op<
+    "quantized_decomposed.dequantize_per_channel_group", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly,
+  ]> {
+  let summary = "PT2E dequantize_per_channel_group";
+  let description = [{
+    Dequantizes an integer tensor with per-channel-group affine quantization.
+
+    The input tensor is dequantized in groups along the last dimension.
+    `scales` has shape `[num_channels, num_groups]` where
+    `num_groups = input.shape[-1] / group_size`. `zero_points` may be None
+    for symmetric quantization.
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$input,
+    AnyTorchTensorType:$scales,
+    AnyTorchOptionalTensorType:$zero_points,
+    Torch_IntType:$quant_min,
+    Torch_IntType:$quant_max,
+    Torch_IntType:$dtype,
+    Torch_IntType:$group_size,
+    Torch_IntType:$out_dtype
+  );
+  let results = (outs AnyTorchTensorType:$result);
+  let assemblyFormat = [{
+    $input `,` $scales `,` $zero_points `,` $quant_min `,`
+        $quant_max `,` $dtype `,` $group_size `,` $out_dtype attr-dict
+    `:` qualified(type($input)) `,` qualified(type($scales)) `,`
+        qualified(type($zero_points)) `,` qualified(type($quant_min)) `,`
+        qualified(type($quant_max)) `,` qualified(type($dtype)) `,`
+        qualified(type($group_size)) `,` qualified(type($out_dtype))
+    `->` qualified(type($result))
+  }];
 }
 
 #endif // TORCH_OPS

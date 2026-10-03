@@ -5,9 +5,9 @@
 
 import torch
 
+from torch_mlir_e2e_test.annotations import annotate_args, export
 from torch_mlir_e2e_test.framework import TestUtils
 from torch_mlir_e2e_test.registry import register_test_case
-from torch_mlir_e2e_test.annotations import annotate_args, export
 
 # ==============================================================================
 
@@ -84,6 +84,158 @@ def Matmul_2d(module, tu: TestUtils):
 # ==============================================================================
 
 
+class MatmulZeroK(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([5, 0], torch.float32, True),
+            ([0, 10], torch.float32, True),
+        ]
+    )
+    def forward(self, lhs, rhs):
+        return torch.matmul(lhs, rhs)
+
+
+@register_test_case(module_factory=lambda: MatmulZeroK())
+def MatmulZeroK_basic(module, tu: TestUtils):
+    module.forward(torch.empty(5, 0), torch.empty(0, 10))
+
+
+class AtenScaledMmPerTensorModule(torch.nn.Module):
+    def __init__(self, fp8_dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16):
+        super().__init__()
+        self.fp8_dtype = fp8_dtype
+        self.out_dtype = out_dtype
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([16, 16], torch.float32, True),
+            ([16, 16], torch.float32, True),
+            ([], torch.float32, True),
+            ([], torch.float32, True),
+        ]
+    )
+    def forward(self, lhs, rhs, scale_lhs, scale_rhs):
+        lhs_fp8 = lhs.to(self.fp8_dtype)
+        rhs_fp8 = rhs.to(self.fp8_dtype)
+        return torch._scaled_mm(
+            lhs_fp8,
+            rhs_fp8,
+            scale_lhs,
+            scale_rhs,
+            out_dtype=self.out_dtype,
+        )
+
+
+@register_test_case(module_factory=lambda: AtenScaledMmPerTensorModule())
+def AtenScaledMmPerTensorModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(16, 16), tu.rand(16, 16), tu.rand(), tu.rand())
+
+
+@register_test_case(
+    module_factory=lambda: AtenScaledMmPerTensorModule(out_dtype=torch.float16)
+)
+def AtenScaledMmPerTensorF16Module_basic(module, tu: TestUtils):
+    module.forward(tu.rand(16, 16), tu.rand(16, 16), tu.rand(), tu.rand())
+
+
+@register_test_case(
+    module_factory=lambda: AtenScaledMmPerTensorModule(out_dtype=torch.float32)
+)
+def AtenScaledMmPerTensorF32Module_basic(module, tu: TestUtils):
+    module.forward(tu.rand(16, 16), tu.rand(16, 16), tu.rand(), tu.rand())
+
+
+@register_test_case(
+    module_factory=lambda: AtenScaledMmPerTensorModule(fp8_dtype=torch.float8_e5m2)
+)
+def AtenScaledMmPerTensorE5M2Module_basic(module, tu: TestUtils):
+    module.forward(tu.rand(16, 16), tu.rand(16, 16), tu.rand(), tu.rand())
+
+
+# ==============================================================================
+
+
+class AtenScaledMmBlockScaledFp8Module(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([3, 32], torch.float32, True),
+            ([32, 64], torch.float32, True),
+            ([512], torch.float8_e8m0fnu, True),
+            ([512], torch.float8_e8m0fnu, True),
+        ]
+    )
+    def forward(self, lhs, rhs, scale_lhs, scale_rhs):
+        lhs_fp8 = lhs.to(torch.float8_e4m3fn)
+        rhs_fp8 = rhs.to(torch.float8_e4m3fn)
+        return torch._scaled_mm(
+            lhs_fp8,
+            rhs_fp8,
+            scale_lhs,
+            scale_rhs,
+            out_dtype=torch.bfloat16,
+        )
+
+
+@register_test_case(module_factory=lambda: AtenScaledMmBlockScaledFp8Module())
+def AtenScaledMmBlockScaledFp8Module_basic(module, tu: TestUtils):
+    module.forward(
+        tu.rand(3, 32),
+        tu.rand(32, 64),
+        torch.ones(512, dtype=torch.float8_e8m0fnu),
+        torch.ones(512, dtype=torch.float8_e8m0fnu),
+    )
+
+
+class AtenScaledMmBlockScaledFp8SwizzledModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer(
+            "scale_lhs", torch.ones(32, 16, dtype=torch.float8_e8m0fnu)
+        )
+        self.register_buffer(
+            "scale_rhs", torch.ones(32, 16, dtype=torch.float8_e8m0fnu)
+        )
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([3, 32], torch.float32, True),
+            ([32, 64], torch.float32, True),
+        ]
+    )
+    def forward(self, lhs, rhs):
+        lhs_fp8 = lhs.to(torch.float8_e4m3fn)
+        rhs_fp8 = rhs.to(torch.float8_e4m3fn)
+        return torch._scaled_mm(
+            lhs_fp8,
+            rhs_fp8,
+            self.scale_lhs,
+            self.scale_rhs,
+            out_dtype=torch.bfloat16,
+        )
+
+
+@register_test_case(module_factory=lambda: AtenScaledMmBlockScaledFp8SwizzledModule())
+def AtenScaledMmBlockScaledFp8SwizzledModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(3, 32), tu.rand(32, 64))
+
+
+# ==============================================================================
+
+
 class MatmulVecMat(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -151,6 +303,30 @@ class Matmul3D(torch.nn.Module):
 @register_test_case(module_factory=lambda: Matmul3D())
 def Matmul_3d(module, tu: TestUtils):
     module.forward(tu.rand(3, 4, 5), tu.rand(3, 5, 4))
+
+
+# ==============================================================================
+
+
+class Matmul3DStaticBroadcast(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([4, 8, 5], torch.float32, True),
+            ([1, 5, 6], torch.float32, True),
+        ]
+    )
+    def forward(self, lhs, rhs):
+        return torch.matmul(lhs, rhs)
+
+
+@register_test_case(module_factory=lambda: Matmul3DStaticBroadcast())
+def Matmul3DStaticBroadcast_basic(module, tu: TestUtils):
+    module.forward(tu.rand(4, 8, 5), tu.rand(1, 5, 6))
 
 
 # ==============================================================================
@@ -318,6 +494,48 @@ def AtenMmFloatTypes_basic(module, tu: TestUtils):
 # ==============================================================================
 
 
+class AtenMmZeroK(torch.nn.Module):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([5, 0], torch.float32, True),
+            ([0, 10], torch.float32, True),
+        ]
+    )
+    def forward(self, a, b):
+        return torch.ops.aten.mm(a, b)
+
+
+@register_test_case(module_factory=lambda: AtenMmZeroK())
+def AtenMmZeroK_basic(module, tu: TestUtils):
+    module.forward(torch.empty(5, 0), torch.empty(0, 10))
+
+
+# ==============================================================================
+
+
+class AtenBmmZeroK(torch.nn.Module):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([2, 5, 0], torch.float32, True),
+            ([2, 0, 10], torch.float32, True),
+        ]
+    )
+    def forward(self, a, b):
+        return torch.ops.aten.bmm(a, b)
+
+
+@register_test_case(module_factory=lambda: AtenBmmZeroK())
+def AtenBmmZeroK_basic(module, tu: TestUtils):
+    module.forward(torch.empty(2, 5, 0), torch.empty(2, 0, 10))
+
+
+# ==============================================================================
+
+
 class AtenMmIntTypes(torch.nn.Module):
     @export
     @annotate_args(
@@ -357,6 +575,30 @@ def AtenMmInt8Types_basic(module, tu: TestUtils):
     module.forward(
         tu.randint(16, 4, high=100).to(torch.int8),
         tu.randint(4, 16, high=100).to(torch.int8),
+    )
+
+
+# ==============================================================================
+
+
+class AtenMmInt8ZeroK(torch.nn.Module):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([3, 0], torch.int8, True),
+            ([0, 3], torch.int8, True),
+        ]
+    )
+    def forward(self, a, b):
+        return torch.ops.aten.mm(a, b)
+
+
+@register_test_case(module_factory=lambda: AtenMmInt8ZeroK())
+def AtenMmInt8ZeroK_basic(module, tu: TestUtils):
+    module.forward(
+        torch.empty(3, 0, dtype=torch.int8),
+        torch.empty(0, 3, dtype=torch.int8),
     )
 
 
@@ -508,6 +750,35 @@ class AtenIntMM(torch.nn.Module):
 def AtenIntMM_basic(module, tu: TestUtils):
     module.forward(
         tu.randint(3, 4, low=-128, high=127).to(torch.int8),
+        tu.randint(4, 3, low=-128, high=127).to(torch.int8),
+    )
+
+
+# ==============================================================================
+
+
+class AtenIntMMMixedSigni8(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([3, 4], torch.uint8, True),
+            ([4, 3], torch.int8, True),
+        ]
+    )
+    def forward(self, x, y):
+        return torch._int_mm(x, y)
+
+
+# Values above 127 on the unsigned operand are where a sign-extended cast would
+# silently differ from the reference, so the range is exercised in full.
+@register_test_case(module_factory=lambda: AtenIntMMMixedSigni8())
+def AtenIntMMMixedSigni8_basic(module, tu: TestUtils):
+    module.forward(
+        tu.randint(3, 4, low=0, high=255).to(torch.uint8),
         tu.randint(4, 3, low=-128, high=127).to(torch.int8),
     )
 
@@ -817,6 +1088,28 @@ def AtenLinear2D_basic(module, tu: TestUtils):
 # ==============================================================================
 
 
+class AtenLinearZeroBatch(torch.nn.Module):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([0, 4], torch.float32, True),
+            ([3, 4], torch.float32, True),
+            ([3], torch.float32, True),
+        ]
+    )
+    def forward(self, a, b, c):
+        return torch.ops.aten.linear(a, b, c)
+
+
+@register_test_case(module_factory=lambda: AtenLinearZeroBatch())
+def AtenLinearZeroBatch_basic(module, tu: TestUtils):
+    module.forward(torch.empty(0, 4), tu.rand(3, 4), tu.rand(3))
+
+
+# ==============================================================================
+
+
 class AtenLinear3DBias(torch.nn.Module):
     @export
     @annotate_args(
@@ -834,6 +1127,68 @@ class AtenLinear3DBias(torch.nn.Module):
 @register_test_case(module_factory=lambda: AtenLinear3DBias())
 def AtenLinear3DBias_basic(module, tu: TestUtils):
     module.forward(tu.rand(3, 6, 4), tu.rand(5, 4), tu.rand(5))
+
+
+# ==============================================================================
+
+
+class AtenBilinear2DBiasModule(torch.nn.Module):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([2, 4], torch.float32, True),
+            ([2, 5], torch.float32, True),
+            ([3, 4, 5], torch.float32, True),
+            ([3], torch.float32, True),
+        ]
+    )
+    def forward(self, input1, input2, weight, bias):
+        return torch.ops.aten.bilinear(input1, input2, weight, bias)
+
+
+@register_test_case(module_factory=lambda: AtenBilinear2DBiasModule())
+def AtenBilinear2DBiasModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(2, 4), tu.rand(2, 5), tu.rand(3, 4, 5), tu.rand(3))
+
+
+class AtenBilinear2DNoBiasModule(torch.nn.Module):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([2, 4], torch.float32, True),
+            ([2, 5], torch.float32, True),
+            ([3, 4, 5], torch.float32, True),
+        ]
+    )
+    def forward(self, input1, input2, weight):
+        return torch.ops.aten.bilinear(input1, input2, weight)
+
+
+@register_test_case(module_factory=lambda: AtenBilinear2DNoBiasModule())
+def AtenBilinear2DNoBiasModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(2, 4), tu.rand(2, 5), tu.rand(3, 4, 5))
+
+
+class AtenBilinear3DBiasModule(torch.nn.Module):
+    @export
+    @annotate_args(
+        [
+            None,
+            ([2, 3, 4], torch.float32, True),
+            ([2, 3, 5], torch.float32, True),
+            ([6, 4, 5], torch.float32, True),
+            ([6], torch.float32, True),
+        ]
+    )
+    def forward(self, input1, input2, weight, bias):
+        return torch.ops.aten.bilinear(input1, input2, weight, bias)
+
+
+@register_test_case(module_factory=lambda: AtenBilinear3DBiasModule())
+def AtenBilinear3DBiasModule_basic(module, tu: TestUtils):
+    module.forward(tu.rand(2, 3, 4), tu.rand(2, 3, 5), tu.rand(6, 4, 5), tu.rand(6))
 
 
 # ==============================================================================
@@ -963,3 +1318,57 @@ class AtenLinalgCrossDynamic(torch.nn.Module):
 @register_test_case(module_factory=lambda: AtenLinalgCrossDynamic())
 def AtenLinalgCrossDynamic_basic(module, tu: TestUtils):
     module.forward(tu.rand(4, 3, 1, 6), tu.rand(4, 3, 7, 1))
+
+
+# ==============================================================================
+
+
+class AtenOuterFloat(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args([None, ([-1], torch.float32, True), ([-1], torch.float32, True)])
+    def forward(self, a, b):
+        return torch.ops.aten.outer(a, b)
+
+
+@register_test_case(module_factory=lambda: AtenOuterFloat())
+def AtenOuterFloat_basic(module, tu: TestUtils):
+    module.forward(tu.rand(4), tu.rand(3))
+
+
+# ==============================================================================
+
+
+class AtenOuterInt(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args([None, ([-1], torch.int64, True), ([-1], torch.int64, True)])
+    def forward(self, a, b):
+        return torch.ops.aten.outer(a, b)
+
+
+@register_test_case(module_factory=lambda: AtenOuterInt())
+def AtenOuterInt_basic(module, tu: TestUtils):
+    module.forward(tu.randint(4), tu.randint(3))
+
+
+# ==============================================================================
+
+
+class AtenOuterF32F64(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args([None, ([-1], torch.float32, True), ([-1], torch.float64, True)])
+    def forward(self, a, b):
+        return torch.ops.aten.outer(a, b)
+
+
+@register_test_case(module_factory=lambda: AtenOuterF32F64())
+def AtenOuterF32F64_basic(module, tu: TestUtils):
+    module.forward(tu.rand(4), tu.rand(3).to(torch.float64))

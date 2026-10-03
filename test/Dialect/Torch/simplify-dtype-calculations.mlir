@@ -24,6 +24,84 @@ func.func @basic(%arg0: !torch.vtensor<*,f32>) -> !torch.vtensor {
 
 // -----
 
+// Same-type promotion must preserve UInt32.
+// CHECK-LABEL: func.func @promote_dtypes$tensor_tensor_uint32
+// CHECK: %[[DTYPE:.*]] = torch.constant.int 28
+// CHECK: return %[[DTYPE]] : !torch.int
+func.func @promote_dtypes$tensor_tensor_uint32(%arg0: !torch.vtensor<[4],ui32>, %arg1: !torch.vtensor<[4],ui32>) -> !torch.int {
+  %rank = torch.constant.int 1
+  %dtype0 = torch.prim.dtype %arg0 : !torch.vtensor<[4],ui32> -> !torch.int
+  %dtype1 = torch.prim.dtype %arg1 : !torch.vtensor<[4],ui32> -> !torch.int
+  %ranks = torch.prim.ListConstruct %rank, %rank : (!torch.int, !torch.int) -> !torch.list<optional<int>>
+  %dtypes = torch.prim.ListConstruct %dtype0, %dtype1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %result = torch.promote_dtypes %ranks, %dtypes : (!torch.list<optional<int>>, !torch.list<int>) -> !torch.int
+  return %result : !torch.int
+}
+
+// -----
+
+// Mixed UInt32/Float promotion preserves Float in either operand order.
+// CHECK-LABEL: func.func @promote_dtypes$tensor_tensor_uint32_float
+// CHECK: %[[DTYPE:.*]] = torch.constant.int 6
+// CHECK: return %[[DTYPE]] : !torch.int
+func.func @promote_dtypes$tensor_tensor_uint32_float(%arg0: !torch.vtensor<[4],ui32>, %arg1: !torch.vtensor<[4],f32>) -> !torch.int {
+  %rank = torch.constant.int 1
+  %dtype0 = torch.prim.dtype %arg0 : !torch.vtensor<[4],ui32> -> !torch.int
+  %dtype1 = torch.prim.dtype %arg1 : !torch.vtensor<[4],f32> -> !torch.int
+  %ranks = torch.prim.ListConstruct %rank, %rank : (!torch.int, !torch.int) -> !torch.list<optional<int>>
+  %dtypes = torch.prim.ListConstruct %dtype0, %dtype1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %result = torch.promote_dtypes %ranks, %dtypes : (!torch.list<optional<int>>, !torch.list<int>) -> !torch.int
+  return %result : !torch.int
+}
+
+// -----
+
+// CHECK-LABEL: func.func @promote_dtypes$tensor_tensor_float_uint32
+// CHECK: %[[DTYPE:.*]] = torch.constant.int 6
+// CHECK: return %[[DTYPE]] : !torch.int
+func.func @promote_dtypes$tensor_tensor_float_uint32(%arg0: !torch.vtensor<[4],f32>, %arg1: !torch.vtensor<[4],ui32>) -> !torch.int {
+  %rank = torch.constant.int 1
+  %dtype0 = torch.prim.dtype %arg0 : !torch.vtensor<[4],f32> -> !torch.int
+  %dtype1 = torch.prim.dtype %arg1 : !torch.vtensor<[4],ui32> -> !torch.int
+  %ranks = torch.prim.ListConstruct %rank, %rank : (!torch.int, !torch.int) -> !torch.list<optional<int>>
+  %dtypes = torch.prim.ListConstruct %dtype0, %dtype1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %result = torch.promote_dtypes %ranks, %dtypes : (!torch.list<optional<int>>, !torch.list<int>) -> !torch.int
+  return %result : !torch.int
+}
+
+// -----
+
+// Mixed UInt32/Long promotion is unsupported in either operand order.
+// CHECK-LABEL: func.func @promote_dtypes$tensor_tensor_uint32_long
+// CHECK: %[[DTYPE:.*]] = torch.constant.int 47
+// CHECK: return %[[DTYPE]] : !torch.int
+func.func @promote_dtypes$tensor_tensor_uint32_long(%arg0: !torch.vtensor<[4],ui32>, %arg1: !torch.vtensor<[4],si64>) -> !torch.int {
+  %rank = torch.constant.int 1
+  %dtype0 = torch.prim.dtype %arg0 : !torch.vtensor<[4],ui32> -> !torch.int
+  %dtype1 = torch.prim.dtype %arg1 : !torch.vtensor<[4],si64> -> !torch.int
+  %ranks = torch.prim.ListConstruct %rank, %rank : (!torch.int, !torch.int) -> !torch.list<optional<int>>
+  %dtypes = torch.prim.ListConstruct %dtype0, %dtype1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %result = torch.promote_dtypes %ranks, %dtypes : (!torch.list<optional<int>>, !torch.list<int>) -> !torch.int
+  return %result : !torch.int
+}
+
+// -----
+
+// CHECK-LABEL: func.func @promote_dtypes$tensor_tensor_long_uint32
+// CHECK: %[[DTYPE:.*]] = torch.constant.int 47
+// CHECK: return %[[DTYPE]] : !torch.int
+func.func @promote_dtypes$tensor_tensor_long_uint32(%arg0: !torch.vtensor<[4],si64>, %arg1: !torch.vtensor<[4],ui32>) -> !torch.int {
+  %rank = torch.constant.int 1
+  %dtype0 = torch.prim.dtype %arg0 : !torch.vtensor<[4],si64> -> !torch.int
+  %dtype1 = torch.prim.dtype %arg1 : !torch.vtensor<[4],ui32> -> !torch.int
+  %ranks = torch.prim.ListConstruct %rank, %rank : (!torch.int, !torch.int) -> !torch.list<optional<int>>
+  %dtypes = torch.prim.ListConstruct %dtype0, %dtype1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %result = torch.promote_dtypes %ranks, %dtypes : (!torch.list<optional<int>>, !torch.list<int>) -> !torch.int
+  return %result : !torch.int
+}
+
+// -----
+
 // CHECK-LABEL:   func.func @promote_dtypes$tensor_tensor_same_category_different_width(
 // CHECK:             {{.*}} = torch.aten.add.Tensor {{.*}} -> !torch.vtensor<[1],f64>
 func.func @promote_dtypes$tensor_tensor_same_category_different_width(%arg0: !torch.vtensor<[1],f32>, %arg1: !torch.vtensor<[1],f64>, %arg2: !torch.float) {
@@ -211,6 +289,37 @@ func.func @promote_dtypes$scalar_scalar_same_category(%arg0: !torch.int, %arg1: 
     torch.dtype.calculate.yield.dtypes %7 : !torch.int
   } : !torch.number
   return %0 : !torch.number
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @promote_dtypes$list_tensors
+// CHECK:             {{.*}} = torch.aten.cat {{.*}} : !torch.list<vtensor>, !torch.int -> !torch.vtensor<*,f32>
+func.func @promote_dtypes$list_tensors(%arg0: !torch.vtensor<[1,8,320,384],f32>) -> !torch.vtensor {
+  %int0 = torch.constant.int 0
+  %int1 = torch.constant.int 1
+  %true = torch.constant.bool true
+  %int-3 = torch.constant.int -3
+  %0 = torch.prim.ListConstruct %arg0 : (!torch.vtensor<[1,8,320,384],f32>) -> !torch.list<vtensor>
+  %1 = torch.dtype.calculate {
+    %2 = torch.aten.cat %0, %int-3 : !torch.list<vtensor>, !torch.int -> !torch.vtensor
+    torch.dtype.calculate.yield %2 : !torch.vtensor
+  } dtypes {
+    %2 = torch.prim.ListConstruct  : () -> !torch.list<tuple<int, int>>
+    torch.prim.Loop %int1, %true, init() {
+    ^bb0(%arg1: !torch.int):
+      %5 = torch.aten.__getitem__.t %0, %arg1 : !torch.list<vtensor>, !torch.int -> !torch.vtensor
+      %6 = torch.aten.dim %5 : !torch.vtensor -> !torch.int
+      %7 = torch.prim.dtype %5 : !torch.vtensor -> !torch.int
+      %8 = torch.prim.TupleConstruct %6, %7 : !torch.int, !torch.int -> !torch.tuple<int, int>
+      %9 = torch.aten.append.t %2, %8 : !torch.list<tuple<int, int>>, !torch.tuple<int, int> -> !torch.list<tuple<int, int>>
+      torch.prim.Loop.condition %true, iter()
+    } : (!torch.int, !torch.bool) -> ()
+    %3 = torch.aten.__getitem__.t %2, %int0 : !torch.list<tuple<int, int>>, !torch.int -> !torch.tuple<int, int>
+    %4:2 = torch.prim.TupleUnpack %3 : !torch.tuple<int, int> -> !torch.int, !torch.int
+    torch.dtype.calculate.yield.dtypes %4#1 : !torch.int
+  } : !torch.vtensor
+  return %1 : !torch.vtensor
 }
 
 // -----

@@ -239,6 +239,7 @@ class NodeImporter:
         "_p",
         "_b",
         "_nv_map",
+        "_none_value",
     ]
 
     def __init__(
@@ -259,6 +260,7 @@ class NodeImporter:
         self._p = parent_op
         self._b = block
         self._nv_map: Dict[str, Value] = {}
+        self._none_value: Optional[Value] = None
 
     @classmethod
     def define_function(
@@ -282,8 +284,7 @@ class NodeImporter:
                 cc.type_proto_to_type(inp.type) for inp in graph_info.input_map.values()
             ]
             output_types = [
-                cc.type_proto_to_type(out.type)
-                for out in graph_info.output_map.values()
+                cc.type_proto_to_type(out.type) for out in graph_info.graph_proto.output
             ]
             ftype = FunctionType.get(input_types, output_types)
             func_op = func_dialect.FuncOp(
@@ -352,12 +353,12 @@ class NodeImporter:
             self.import_node(node)
 
         outputs = []
-        for output_name in self._gi.output_map.keys():
+        for out in self._gi.graph_proto.output:
             try:
-                outputs.append(self._nv_map[output_name])
+                outputs.append(self._nv_map[out.name])
             except KeyError:
                 raise OnnxImportError(
-                    f"Non topologically produced ONNX graph output '{output_name}'"
+                    f"Non topologically produced ONNX graph output '{out.name}'"
                 )
         with InsertionPoint(self._b), Location.unknown():
             if func:
@@ -366,8 +367,8 @@ class NodeImporter:
                 Operation.create(name="torch.operator_terminator", operands=outputs)
 
     def get_none(self):
-        if "" in self._nv_map:
-            return self._nv_map[""]
+        if self._none_value is not None:
+            return self._none_value
 
         with InsertionPoint(self._b), Location.name("onnx_importer.none"):
             nne = Operation.create(
@@ -376,7 +377,7 @@ class NodeImporter:
                 operands=[],
                 attributes={},
             ).results[0]
-            self._nv_map[""] = nne
+            self._none_value = nne
             return nne
 
     def import_node(self, node: onnx.NodeProto):
@@ -396,6 +397,12 @@ class NodeImporter:
             input_values = []
             input_type_protos = []
             for input_name in node.input:
+                # ONNX uses the empty string for omitted optional inputs; it must not
+                # be confused with _nv_map[""], which may hold a real tensor named "".
+                if input_name == "":
+                    input_values.append(self.get_none())
+                    input_type_protos.append(onnx.TypeProto())
+                    continue
                 try:
                     input_values.append(self._nv_map[input_name])
                     # Missing optional arguments will have empty types
@@ -447,7 +454,8 @@ class NodeImporter:
                 self.import_regions(node.attribute, custom_op)
 
             for output_name, output_value in zip(output_names, custom_op.results):
-                self._nv_map[output_name] = output_value
+                if output_name != "":
+                    self._nv_map[output_name] = output_value
 
     def import_attributes(self, onnx_attrs: List[onnx.AttributeProto]):
         attrs = {}
@@ -1135,11 +1143,7 @@ ELEM_TYPE_INLINE_TENSOR_PROTO_CB = {
         np.asarray(tp.float_data, dtype=np.float32).reshape(tp.dims), signless=False
     ),
     onnx.TensorProto.DataType.BOOL: lambda tp: DenseElementsAttr.get(
-        np.packbits(
-            np.asarray(tp.int32_data, dtype=np.bool_).reshape(tp.dims),
-            axis=None,
-            bitorder="little",
-        ),
+        np.asarray(tp.int32_data, dtype=np.bool_).reshape(tp.dims),
         shape=tp.dims,
         type=IntegerType.get_signless(1),
     ),

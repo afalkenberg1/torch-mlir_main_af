@@ -42,6 +42,13 @@ bool isScale32(mlir::quant::UniformQuantizedType output_element_type);
 Value getTosaConstTensorSingleF32(PatternRewriter &rewriter, Operation *op,
                                   float val);
 
+// Create a scalar float constant cast to `like`'s element type and reshape it
+// as needed so it can participate in broadcastable elementwise ops with
+// `like`.
+FailureOr<Value> getBroadcastableConstTensorSingleF32(PatternRewriter &rewriter,
+                                                      Operation *op, Value like,
+                                                      float val);
+
 // Create an int8_t const tosa.mul shift tensor from an int
 Value getTosaMulShiftConstTensor(PatternRewriter &rewriter, Operation *op,
                                  int32_t shift);
@@ -59,10 +66,26 @@ std::optional<Value> getConstTensor(PatternRewriter &rewriter, Operation *op,
                                     ArrayRef<T> vec, ArrayRef<int64_t> shape,
                                     std::optional<Type> dtype = {});
 
+// Create a splat constant without materializing one host value per tensor
+// element.
+template <typename T>
+std::optional<Value>
+getSplatConstTensor(PatternRewriter &rewriter, Operation *op, T value,
+                    ArrayRef<int64_t> shape, std::optional<Type> dtype = {});
+
 // Default function to create tosa.cast op. This should be called instead of
 // directly calling rewriter.create<tosa::CastOp>.
 std::optional<Value> tosaCastTensorToType(PatternRewriter &rewriter, Value src,
                                           TensorType destType);
+
+// Ensure TOSA argmax input is f32 by inserting a tosa.cast when needed.
+Value legalizeArgMaxInputType(PatternRewriter &rewriter, Operation *op,
+                              Value input);
+
+// Create a tosa.gather op. Casts i1 inputs to i8 internally if needed.
+std::optional<Value> createGatherOp(PatternRewriter &rewriter, Location loc,
+                                    RankedTensorType resultType, Value input,
+                                    Value indices);
 
 // Creates a TOSA operation and performs shape inference on the individual
 // op. This allows shape inference during the framework to TOSA lowering.
@@ -115,6 +138,17 @@ Value emitExplicitZeroPadNHWC(Location loc, PatternRewriter &rewriter,
 // constant 0.
 FailureOr<Value> getZeroPointValue(PatternRewriter &rewriter, Operation *op,
                                    Value tensor, Type elemType);
+
+// Check if a shaped type has any dimension with size 0.
+bool typeHasZeroDim(ShapedType type);
+
+// Check if a type is i1 or a shaped type with i1 element type.
+bool isI1Type(Type type);
+
+// Compute scale/offset/border parameters for TOSA resize on one dimension.
+void computeResizeParams(int inputSize, int outputSize, bool alignCorners,
+                         tosa::ResizeMode mode, int &scaleN, int &scaleD,
+                         int &offset, int &border);
 
 } // namespace tosa
 } // namespace mlir

@@ -16,6 +16,12 @@
 #   TORCH_MLIR_ENABLE_LTC:
 #       enables the Lazy Tensor Core Backend
 #
+#   TORCH_MLIR_ENABLE_STABLEHLO:
+#       enables the StableHLO Backend
+#
+#   CMAKE_DISABLE_PRECOMPILE_HEADERS:
+#       disables precompiled headers during CMake build
+#
 #   LLVM_INSTALL_DIR:
 #       build the project *out-of-tree* using the built llvm-project
 #
@@ -37,6 +43,14 @@
 # variables by prefixing to above invocations:
 # ```
 # CMAKE_GENERATOR=Ninja CMAKE_C_COMPILER_LAUNCHER=ccache CMAKE_CXX_COMPILER_LAUNCHER=ccache
+# ```
+#
+# For release builds, use cibuildwheel. Except for
+# TORCH_MLIR_PYTHON_PACKAGE_VERSION, the environment variables needed for
+# cibuildwheel are set in pyproject.toml. For an example local run:
+#
+# ```
+# CIBW_BUILD="cp312-manylinux_x86_64" cibuildwheel --platform linux
 # ```
 #
 # Implementation notes:
@@ -75,8 +89,12 @@ PACKAGE_VERSION = os.getenv("TORCH_MLIR_PYTHON_PACKAGE_VERSION", "0.0.1")
 
 # If true, enable LTC build by default
 TORCH_MLIR_ENABLE_LTC = _check_env_flag("TORCH_MLIR_ENABLE_LTC", True)
+TORCH_MLIR_ENABLE_STABLEHLO = _check_env_flag("TORCH_MLIR_ENABLE_STABLEHLO", True)
 TORCH_MLIR_ENABLE_ONLY_MLIR_PYTHON_BINDINGS = _check_env_flag(
     "TORCH_MLIR_ENABLE_ONLY_MLIR_PYTHON_BINDINGS", True
+)
+CMAKE_DISABLE_PRECOMPILE_HEADERS = _check_env_flag(
+    "CMAKE_DISABLE_PRECOMPILE_HEADERS", True
 )
 LLVM_INSTALL_DIR = os.getenv("LLVM_INSTALL_DIR", None)
 SRC_DIR = pathlib.Path(__file__).parent.absolute()
@@ -104,6 +122,9 @@ class CustomBuild(_build):
         self.run_command("build_scripts")
 
 
+use_stable_abi = sys.version_info >= (3, 12)
+
+
 class CMakeBuild(build_py):
     def cmake_build(self, cmake_build_dir):
         llvm_dir = str(SRC_DIR / "externals" / "llvm-project" / "llvm")
@@ -124,8 +145,14 @@ class CMakeBuild(build_py):
             f"-DCMAKE_C_VISIBILITY_PRESET=hidden",
             f"-DCMAKE_CXX_VISIBILITY_PRESET=hidden",
             f"-DTORCH_MLIR_ENABLE_LTC={'ON' if TORCH_MLIR_ENABLE_LTC else 'OFF'}",
+            f"-DTORCH_MLIR_ENABLE_STABLEHLO={'ON' if TORCH_MLIR_ENABLE_STABLEHLO else 'OFF'}",
             f"-DTORCH_MLIR_ENABLE_PYTORCH_EXTENSIONS={'OFF' if TORCH_MLIR_ENABLE_ONLY_MLIR_PYTHON_BINDINGS else 'ON'}",
+            f"-DMLIR_ENABLE_PYTHON_STABLE_ABI={'ON' if use_stable_abi else 'OFF'}",
+            f"-DCMAKE_DISABLE_PRECOMPILE_HEADERS={'ON' if CMAKE_DISABLE_PRECOMPILE_HEADERS else 'OFF'}",
         ]
+        for compiler_var in ["CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER"]:
+            if compiler_var in os.environ:
+                cmake_config_args.append(f"-D{compiler_var}={os.environ[compiler_var]}")
         if LLVM_INSTALL_DIR:
             cmake_config_args += [
                 f"-DMLIR_DIR='{LLVM_INSTALL_DIR}/lib/cmake/mlir/'",
@@ -214,7 +241,7 @@ class CMakeBuild(build_py):
 
 class CMakeExtension(Extension):
     def __init__(self, name, sourcedir=""):
-        Extension.__init__(self, name, sources=[])
+        Extension.__init__(self, name, sources=[], py_limited_api=use_stable_abi)
         self.sourcedir = os.path.abspath(sourcedir)
 
 
@@ -255,6 +282,10 @@ if not TORCH_MLIR_ENABLE_ONLY_MLIR_PYTHON_BINDINGS:
     )
 
 
+setup_options = {}
+if use_stable_abi:
+    setup_options["bdist_wheel"] = {"py_limited_api": "cp312"}
+
 setup(
     name=NAME,
     version=f"{PACKAGE_VERSION}",
@@ -266,10 +297,16 @@ setup(
     include_package_data=True,
     cmdclass={
         "build": CustomBuild,
-        "built_ext": NoopBuildExtension,
+        "build_ext": NoopBuildExtension,
         "build_py": CMakeBuild,
     },
     ext_modules=EXT_MODULES,
+    # The Python package contents are placed into the build dir by the custom
+    # CMake `build_py` above; there are no source-tree packages to discover.
+    # An explicit empty list disables setuptools auto-discovery (which would
+    # otherwise trip over top-level non-Python dirs like lib/, include/,
+    # projects/, ...).
+    packages=[],
     python_requires=">=3.8",
     install_requires=INSTALL_REQUIRES,
     extras_require={
@@ -284,4 +321,5 @@ setup(
         ],
     },
     zip_safe=False,
+    options=setup_options,
 )

@@ -27,6 +27,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Type,
     TYPE_CHECKING,
     Union,
     Iterable,
@@ -39,6 +40,8 @@ import torch
 import torch.export
 import torch.fx as torch_fx
 from torch.fx.passes.shape_prop import TensorMetadata
+
+from .fx_as_strided import rewrite_as_strided
 
 from torch import (
     dtype as TorchDtype,
@@ -53,6 +56,7 @@ from torch._ops import (
 from torch._subclasses import (
     FakeTensor as TorchFakeTensor,
 )
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 
 from torch.fx import (
     Graph,
@@ -110,10 +114,12 @@ from ..ir import (
     FloatAttr,
     BF16Type,
     ComplexType,
+    Float4E2M1FNType,
     Float8E5M2Type,
     Float8E4M3FNType,
     Float8E5M2FNUZType,
     Float8E4M3FNUZType,
+    Float8E8M0FNUType,
     F16Type,
     F32Type,
     F64Type,
@@ -153,6 +159,7 @@ TORCH_DTYPE_TO_MLIR_TYPE_ASM = {
     torch.float32: "f32",
     torch.float64: "f64",
     torch.uint8: "ui8",
+    torch.uint32: "ui32",
     torch.int8: "si8",
     torch.int16: "si16",
     torch.int32: "si32",
@@ -170,6 +177,8 @@ OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE_ASM = {
     "float8_e4m3fn": "f8E4M3FN",
     "float8_e5m2fnuz": "f8E5M2FNUZ",
     "float8_e4m3fnuz": "f8E4M3FNUZ",
+    "float8_e8m0fnu": "f8E8M0FNU",
+    "float4_e2m1fn_x2": "f4E2M1FN",
 }
 for dtype_str, dtype_asm in OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE_ASM.items():
     if hasattr(torch, dtype_str):
@@ -181,6 +190,7 @@ TORCH_DTYPE_TO_MLIR_TYPE: Dict[torch.dtype, Callable[[], IrType]] = {
     torch.float32: lambda: F32Type.get(),
     torch.float64: lambda: F64Type.get(),
     torch.uint8: lambda: IntegerType.get_unsigned(8),
+    torch.uint32: lambda: IntegerType.get_unsigned(32),
     torch.int8: lambda: IntegerType.get_signed(8),
     torch.int16: lambda: IntegerType.get_signed(16),
     torch.int32: lambda: IntegerType.get_signed(32),
@@ -198,6 +208,8 @@ OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE = {
     "float8_e4m3fn": lambda: Float8E4M3FNType.get(),
     "float8_e5m2fnuz": lambda: Float8E5M2FNUZType.get(),
     "float8_e4m3fnuz": lambda: Float8E4M3FNUZType.get(),
+    "float8_e8m0fnu": lambda: Float8E8M0FNUType.get(),
+    "float4_e2m1fn_x2": lambda: Float4E2M1FNType.get(),
 }
 for dtype_str, mlir_type in OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE.items():
     if hasattr(torch, dtype_str):
@@ -207,6 +219,7 @@ TORCH_DTYPE_TO_NPY_TYPE = {
     # torch.qint8: None, # no equivalent np datatype
     # torch.quint8: None,
     torch.uint8: np.uint8,
+    torch.uint32: np.uint32,
     torch.int8: np.int8,
     torch.int16: np.int16,
     torch.int32: np.int32,
@@ -225,6 +238,7 @@ if ml_dtypes is not None:
     TORCH_DTYPE_TO_NPY_TYPE[torch.float8_e4m3fn] = ml_dtypes.float8_e4m3fn
     TORCH_DTYPE_TO_NPY_TYPE[torch.float8_e5m2fnuz] = ml_dtypes.float8_e5m2fnuz
     TORCH_DTYPE_TO_NPY_TYPE[torch.float8_e4m3fnuz] = ml_dtypes.float8_e4m3fnuz
+    TORCH_DTYPE_TO_NPY_TYPE[torch.float8_e8m0fnu] = ml_dtypes.float8_e8m0fnu
 
 TORCH_DTYPE_TO_INT = {
     torch.uint8: 0,
@@ -243,6 +257,7 @@ TORCH_DTYPE_TO_INT = {
     # torch.quint8: 13,
     # torch.qint32 14
     torch.bfloat16: 15,
+    torch.uint32: 28,
 }
 # Type entries added only in torch with higher version
 OPTIONAL_TORCH_DTYPE_TO_INT = {
@@ -250,6 +265,8 @@ OPTIONAL_TORCH_DTYPE_TO_INT = {
     "float8_e4m3fn": 24,
     "float8_e5m2fnuz": 25,
     "float8_e4m3fnuz": 26,
+    "float8_e8m0fnu": 44,
+    "float4_e2m1fn_x2": 45,
 }
 for dtype_str, dtype_int in OPTIONAL_TORCH_DTYPE_TO_INT.items():
     if hasattr(torch, dtype_str):
@@ -284,6 +301,7 @@ PY_BUILTIN_TO_TORCH_OP = {
     "mod": torch.ops.aten.fmod,
     "eq": torch.ops.aten.eq,
     "floordiv": torch.ops.aten.floordiv,
+    "neg": torch.ops.aten.neg,
 }
 
 # torch with cuda has a __version__ that looks like  "2.1.0+cu113",
@@ -454,6 +472,16 @@ def is_builtin_function_or_method(obj: Any) -> bool:
     return isinstance(obj, (BuiltinMethodType, BuiltinFunctionType))
 
 
+def is_scalar_arg(arg: NodeArgument) -> bool:
+    """Check whether an arg is, or carries a meta val of, a literal or symbolic scalar."""
+    if isinstance(arg, (float, int)) or is_symbolic(arg):
+        return True
+    if isinstance(arg, torch_fx.Node):
+        val = arg.meta.get("val")
+        return isinstance(val, (float, int)) or is_symbolic(val)
+    return False
+
+
 # TODO: switch back to `slots=True` when py3.9 support is dropped
 @dataclass(frozen=True)
 class InputInfo:
@@ -527,6 +555,9 @@ class FxImporter:
       be one reference tracker per import, but this can be injected to share
       the same uniqueing across imports (i.e. if building multiple functions
       into the same context or module).
+    * graph_node_importer_cls: A GraphNodeImporter subclass used for each
+      imported FX graph. It can extend or override node importing behavior,
+      including ``_import_hop_<name>`` methods for higher-order operators.
     """
 
     __slots__ = [
@@ -536,6 +567,7 @@ class FxImporter:
         "_m_ip",
         "_py_attr_tracker",
         "_hooks",
+        "_graph_node_importer_cls",
         "symbol_table",
         "_graph_module_to_func_name",
         "_func_name_counter",
@@ -549,6 +581,7 @@ class FxImporter:
         config_check: bool = True,
         py_attr_tracker: Optional["RefTracker"] = None,
         hooks: Optional[FxImporterHooks] = None,
+        graph_node_importer_cls: Optional[Type["GraphNodeImporter"]] = None,
     ):
         if module is not None:
             assert context is None, "If configuring with a Module, context must be None"
@@ -564,6 +597,7 @@ class FxImporter:
         self._cc = ContextCache(self._c, py_attr_tracker=self._py_attr_tracker)
         self._m_ip = InsertionPoint(self._m.body)
         self._hooks = hooks or FxImporterHooks()
+        self._graph_node_importer_cls = graph_node_importer_cls or GraphNodeImporter
         self.symbol_table = SymbolTable(self._m.operation)
         self._hooks.prepare_module(self._m.operation)
         # Used specifically in HOPs to map module IDs to function names
@@ -619,6 +653,9 @@ class FxImporter:
         method to control access to mutable buffers and parameters. Without that, the
         default policy is to capture them as frozen values.
         """
+        # Run before Torch IR import while FakeTensor storage metadata is still
+        # available.
+        rewrite_as_strided(prog.graph)
         # Create lookaside table of placeholders/outputs.
         placeholder_nodes: Dict[str, Node] = {}
         all_producer_nodes: Dict[str, Node] = {}
@@ -669,7 +706,7 @@ class FxImporter:
         # producer for the output.
         user_outputs: List[Optional[Node]] = []
         user_output_types: List[IrType] = []
-        for i, output_spec in enumerate(sig.output_specs):
+        for output_spec in sig.output_specs:
             kind = output_spec.kind
             arg = output_spec.arg
             if kind == OutputKind.USER_OUTPUT:
@@ -687,7 +724,7 @@ class FxImporter:
                     )
                 elif isinstance(arg, ConstantArgument):
                     # Constant Outputs don't have a node so we will only store their values
-                    constant_output_values[i] = arg.value
+                    constant_output_values[len(user_outputs)] = arg.value
                     # Placeholder for constant outputs in the node list
                     user_outputs.append(None)
                     user_output_types.append(self._cc.value_info_to_type(arg.value))
@@ -796,7 +833,7 @@ class FxImporter:
             func_op.attributes["torch.assume_strict_symbolic_shapes"] = UnitAttr.get()
             entry_block = Block.create_at_start(func_op.body, ftype.inputs)
 
-        node_importer = GraphNodeImporter(
+        node_importer = self._graph_node_importer_cls(
             self,
             self._c,
             self._cc,
@@ -934,16 +971,14 @@ class FxImporter:
                         "Could not find state mapping for tensor constants"
                     ) from e
                 arg_replacements[input_name] = state_value
-        else:
-            # Lift buffers.
-            for input_name, state_name in sig.inputs_to_buffers.items():
-                try:
-                    state_value = state_dict[state_name]
-                except KeyError as e:
-                    raise AssertionError(
-                        "Could not find state mapping for buffer"
-                    ) from e
-                arg_replacements[input_name] = state_value
+
+        # Always lift buffers.
+        for input_name, state_name in sig.inputs_to_buffers.items():
+            try:
+                state_value = state_dict[state_name]
+            except KeyError as e:
+                raise AssertionError("Could not find state mapping for buffer") from e
+            arg_replacements[input_name] = state_value
 
         # Lift parameters.
         for input_name, state_name in sig.inputs_to_parameters.items():
@@ -1033,6 +1068,10 @@ class FxImporter:
         TODO: This mechanism is deprecated by the `import_program` entry-point and
         it should be removed when no longer required for backwards compatibility.
         """
+        # Run before Torch IR import while FakeTensor storage metadata is still
+        # available. Graph-only callers may be rejected if safe rewriting needs
+        # owning GraphModule state for generated index tensors.
+        rewrite_as_strided(g)
         ftype, loc = self._graph_to_function_meta(g)
         # TODO: The FuncOp constructor requires a context-manager context.
         # Fix upstream and then unnest.
@@ -1045,7 +1084,7 @@ class FxImporter:
                 visibility=func_visibility,
             )
             entry_block = Block.create_at_start(func.body, ftype.inputs)
-        node_importer = GraphNodeImporter(
+        node_importer = self._graph_node_importer_cls(
             self,
             self._c,
             self._cc,
@@ -1245,7 +1284,7 @@ class ContextCache:
 
         raise NotImplementedError(
             f"Could not deduce type from value info: "
-            f"tensor_meta={tensor_meta}, val={val} {type(val)}, sparsity={sparsity}"
+            f"tensor_meta={tensor_meta}, val={val} {type(val)}"
         )
 
     def tensor_metadata_to_type(
@@ -1905,6 +1944,150 @@ class GraphNodeImporter:
         for i, value in enumerate(operation.results):
             self.bind_node_value(node, value, i + bind_none)
 
+    def _import_hop_flex_attention(
+        self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator
+    ):
+        """Imports the torch._higher_order_ops.flex_attention HOP.
+
+        Args format: (query, key, value, score_mod, block_mask, scale, kernel_options, ...)
+        - query, key, value: Attention input tensors
+        - score_mod: Optional submodule/callable for score modification (imported as function)
+        - block_mask: Optional BlockMask tuple containing mask_mod function and runtime tensors
+        - scale: Optional float for attention score scaling
+        - kernel_options: Optional Dict of performance tuning options:
+            - return_lse: Boolean for whether to return the log-sum-exp tensor
+
+        This creates a call to hop_flex_attention with function symbol references for
+        score_mod and mask_mod.
+        """
+        # flex_attention HOP args from PyTorch:
+        # (query, key, value, score_mod, block_mask, scale, kernel_options, ...)
+        (
+            query_arg,
+            key_arg,
+            value_arg,
+            score_mod_arg,
+            block_mask_arg,
+            scale_arg,
+            kernel_options,
+        ) = node.args[:7]
+
+        # Import Q, K, V tensors
+        query = self._import_argument(loc, query_arg, None)
+        key = self._import_argument(loc, key_arg, None)
+        value = self._import_argument(loc, value_arg, None)
+
+        score_mod_ref = None
+        if score_mod_arg is not None and isinstance(score_mod_arg, torch_fx.Node):
+            assert (
+                score_mod_arg.op == "get_attr"
+            ), f"Expected get_attr for score_mod, got {score_mod_arg.op}"
+            root_module = node.graph.owning_module
+            score_mod_module = getattr(root_module, score_mod_arg.target, None)
+            if score_mod_module is not None:
+                score_mod_func_name = self.fx_importer._graph_module_to_func_name[
+                    id(score_mod_module)
+                ]
+                score_mod_ref = FlatSymbolRefAttr.get(score_mod_func_name)
+
+        # Handle block_mask: extract only mask_mod function reference
+        # Note: BlockMask contains runtime tensors (kv_num_blocks, kv_indices, etc.)
+        # that are materialized by evaluating mask_mod(b, h, q_idx, kv_idx).
+        mask_mod_ref = None
+        if block_mask_arg is not None and isinstance(block_mask_arg, tuple):
+            root_module = node.graph.owning_module
+            # The mask_mod function is the last element in the BlockMask tuple
+            mask_mod_arg = block_mask_arg[-1]
+            if mask_mod_arg is not None and isinstance(mask_mod_arg, torch_fx.Node):
+                assert (
+                    mask_mod_arg.op == "get_attr"
+                ), f"Expected get_attr for mask_mod, got {mask_mod_arg.op}"
+                mask_mod_module = getattr(root_module, mask_mod_arg.target, None)
+                if mask_mod_module is not None:
+                    mask_mod_func_name = self.fx_importer._graph_module_to_func_name[
+                        id(mask_mod_module)
+                    ]
+                    mask_mod_ref = FlatSymbolRefAttr.get(mask_mod_func_name)
+
+        # Import scale (float or None)
+        if scale_arg is None:
+            scale = Operation.create(
+                "torch.constant.none",
+                results=[self._cc.torch_none_type],
+                loc=loc,
+            ).result
+        elif isinstance(scale_arg, (int, float)):
+            with loc:
+                scale = _make_constant_op(
+                    "torch.constant.float",
+                    FloatAttr.get_f64(float(scale_arg)),
+                    self._cc.torch_float_type,
+                ).result
+        else:
+            scale = self._import_argument(loc, scale_arg, None)
+
+        # Determine result types from node metadata
+        node_val = node.meta.get("val")
+        if isinstance(node_val, (list, tuple)) and len(node_val) >= 2:
+            # flex_attention returns (output, logsumexp)
+            result_types = [self._cc.value_info_to_type(v) for v in node_val]
+            self._multi_result_nodes.add(node)
+        else:
+            # Single output
+            result_types = [self._cc.node_val_to_type(node)]
+
+        # Extract OUTPUT_LOGSUMEXP and OUTPUT_MAX from kernel_options
+        with loc:
+            return_lse = _make_constant_op(
+                "torch.constant.bool",
+                self._cc.integer_attr(
+                    bool(kernel_options.get("OUTPUT_LOGSUMEXP", 0)), 1
+                ),
+                self._cc.torch_bool_type,
+            ).result
+            return_max_scores = _make_constant_op(
+                "torch.constant.bool",
+                self._cc.integer_attr(bool(kernel_options.get("OUTPUT_MAX", 0)), 1),
+                self._cc.torch_bool_type,
+            ).result
+
+        # Build operands for aten.flex_attention.
+        # Op expects exactly 6 operands: query, key, value, scale, return_lse, return_max_scores.
+        # Note: score_mod_fn and mask_mod_fn go as ATTRIBUTES, not operands.
+        # Note: block_mask tensors are handled by mask_mod_fn, not passed as operands.
+
+        flat_operands = [
+            query,
+            key,
+            value,
+            scale,
+            return_lse,
+            return_max_scores,
+        ]
+
+        # Build attributes with function references
+        # Only include attributes if they're not None (OptionalAttr in TableGen)
+        attributes = {}
+        if score_mod_ref is not None:
+            attributes["score_mod_fn"] = score_mod_ref
+        if mask_mod_ref is not None:
+            attributes["mask_mod_fn"] = mask_mod_ref
+
+        operation = Operation.create(
+            "torch.hop_flex_attention",
+            results=result_types,
+            operands=flat_operands,
+            attributes=attributes if attributes else None,
+            loc=loc,
+        )
+        # Bind results
+        if len(result_types) > 1:
+            self._multi_result_nodes.add(node)
+            for i, value in enumerate(operation.results):
+                self.bind_node_value(node, value, i)
+        else:
+            self.bind_node_value(node, operation.results[0])
+
     def _import_torch_op_overload(
         self,
         loc: Location,
@@ -1919,20 +2102,23 @@ class GraphNodeImporter:
         else:
             target = concrete_target
 
+        if target == torch.ops.aten.as_strided.default:
+            raise NotImplementedError(
+                "aten.as_strided.default must be rewritten before Torch IR import"
+            )
+
         schema = target._schema
         assert isinstance(schema, FunctionSchema)
         mlir_op_name = _get_mlir_op_name_for_schema(schema)
 
         # Intervening to use Scalar ops due to incorrect ops from AOT-autograd with scalar arguments.
-        if mlir_op_name in TENSOR_SCALAR_OP_CONVERTER and (
-            isinstance(node.args[1], float) or isinstance(node.args[1], int)
-        ):
+        if mlir_op_name in TENSOR_SCALAR_OP_CONVERTER and is_scalar_arg(node.args[1]):
             mlir_op_name = TENSOR_SCALAR_OP_CONVERTER[mlir_op_name]
             # we are dynamically changing which op is emitted here due to an issue in
             # torch dynamo where it emits the Tensor variant of ops even when processing
             # scalar arguments, therefore we retrieve the schema as well so that we
             # consume the correct typing information when subsequently importing the
-            # function arguments and result types
+            # function arguments and result types.
             # i.e. the code below is basically doing `schema = torch.ops.aten.my_op.Scalar._schema`
             op_attrs = mlir_op_name.split(".")
             op_overload = getattr(torch, "ops")
@@ -2036,6 +2222,21 @@ class GraphNodeImporter:
                     loc=loc,
                 )
 
+    def _import_get_attr(self, loc: Location, node: Node) -> None:
+        """Bind an attribute once, resolving its qualified path from the module."""
+        # Use the same (Node, result_index) key as bind_node_value and
+        # resolve_node_value; one get_attr may feed multiple operations.
+        if (node, 0) in self._v:
+            return
+        obj = node.graph.owning_module
+        for component in node.target.split("."):
+            assert hasattr(
+                obj, component
+            ), f"Attempting to retrieve attribute '{node.target}' from module, but no such attribute exists"
+            obj = getattr(obj, component)
+        with loc:
+            self.bind_node_value(node, self._import_literal(obj))
+
     def _import_argument(
         self, loc: Location, arg: NodeArgument, expected_jit_type=None
     ) -> Value:
@@ -2046,15 +2247,8 @@ class GraphNodeImporter:
             if arg in self._multi_result_nodes:
                 raise RuntimeError(f"Attempt to de-reference a multi-result node")
 
-            # catch references to dynamically created constant attributes and make sure they have an origin in our module
-            if arg.op == "get_attr" and (arg.target, 0) not in self._v:
-                gm = arg.graph.owning_module
-                assert hasattr(
-                    gm, arg.target
-                ), f"Attempting to retrieve attribute '{arg.target}' from module, but no such attribute exists"
-                obj = getattr(gm, arg.target)
-                with loc:
-                    self.bind_node_value(arg, self._import_literal(obj))
+            if arg.op == "get_attr":
+                self._import_get_attr(loc, arg)
 
             argument_value = self.resolve_node_value(arg)
         elif isinstance(arg, torch_fx.immutable_collections.immutable_list):
@@ -2212,6 +2406,8 @@ class GraphNodeImporter:
             if isinstance(operand, Node):
                 if operand in self._multi_result_nodes:
                     raise RuntimeError(f"Attempt to de-reference a multi-result node")
+                if operand.op == "get_attr":
+                    self._import_get_attr(loc, operand)
                 val = self.resolve_node_value(operand)
                 val_type = str(val.type)
                 assert (
@@ -2368,13 +2564,37 @@ def _make_vtensor_literal_op(
         assert (
             npy_dtype is not None
         ), f"Can not create literal tensor for unsupported datatype: {tensor.dtype}"
-        # We need a raw buffer of data in order to create an ElementsAttr for the invocation of torch.vtensor.literal,
-        # but torch.Tensor does not fulfill the python buffer/array interface hence we must convert to a numpy array to get
-        # a raw buffer of our data. We can't call torch.Tensor.numpy() directly because this internally forces a call to
-        # detach() which throws an error as we are operating in a FakeTensorMode, hence the simplest way to get this raw
-        # buffer is via the indirection: Tensor -> list -> numpy array. This allows us to create a vtensor literal as
-        # desired, but also limits which data types we can support in this function (see TORCH_DTYPE_TO_NPY_TYPE above)
-        np_tensor = np.array(tensor.tolist()).astype(npy_dtype)
+        if (
+            not isinstance(tensor, TorchFakeTensor)
+            and not tensor.is_meta
+            and tensor.layout == torch.strided
+            and tensor.dtype != torch.bool
+            and all(type(dim) is int for dim in tensor.shape)
+            and tensor.numel() > 1
+        ):
+            # Only concrete tensors with known storage reach this branch; do
+            # not disable fake mode to materialize a fake or symbolic tensor.
+            # A byte view avoids per-element Python objects and preserves exact
+            # low-precision encodings. The resource's explicit MLIR tensor type
+            # supplies the element type; uint8 is only the buffer transport.
+            # Copy because the resource retains its buffer: later mutations of
+            # the source tensor must not change the imported constant.
+            with unset_fake_temporarily():
+                np_tensor = (
+                    tensor.detach()
+                    .cpu()
+                    .resolve_conj()
+                    .resolve_neg()
+                    .contiguous()
+                    # A singleton final dimension can retain a non-unit stride.
+                    .reshape(-1)
+                    .view(torch.uint8)
+                    .numpy()
+                    .copy()
+                )
+        else:
+            # Retain the existing conversion for splats and special tensors.
+            np_tensor = np.array(tensor.tolist()).astype(npy_dtype)
         # One element constants are more optimizable as splat DenseElementsAttr. DenseResourceElementsAttr does not
         # support splats, so don't use it for that case. In addition, at the time of writing, it has bugs with handling
         # 0d tensors.
@@ -2388,6 +2608,8 @@ def _make_vtensor_literal_op(
                 type=element_type, array=np_tensor, shape=np_tensor.shape
             )
         else:
+            # Reinterpret, without converting values, so the buffer advertises
+            # the same element alignment as the original typed NumPy path.
             bytes_view = np_tensor.view(npy_dtype)
             tensor_type = create_mlir_tensor_type(tensor)
             shape_desc = "_".join([str(d) for d in tensor.shape])

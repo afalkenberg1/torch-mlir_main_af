@@ -14,6 +14,7 @@
 #include "torch-mlir/Conversion/Utils/Utils.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "llvm/ADT/ArrayRef.h"
+#include <numeric>
 
 namespace mlir {
 namespace tosa {
@@ -107,6 +108,26 @@ Value getTosaConstTensorSingleF32(PatternRewriter &rewriter, Operation *op,
   auto const_op =
       tosa::ConstOp::create(rewriter, op->getLoc(), const_type, const_attr);
   return const_op.getResult();
+}
+
+FailureOr<Value> getBroadcastableConstTensorSingleF32(PatternRewriter &rewriter,
+                                                      Operation *op, Value like,
+                                                      float val) {
+  auto likeTy = dyn_cast<RankedTensorType>(like.getType());
+  if (!likeTy || !isa<FloatType>(likeTy.getElementType()))
+    return failure();
+
+  Value constant = getTosaConstTensorSingleF32(rewriter, op, val);
+  if (!likeTy.getElementType().isF32()) {
+    auto castedConstant = tosa::tosaCastTensorToType(
+        rewriter, constant, RankedTensorType::get({}, likeTy.getElementType()));
+    if (!castedConstant)
+      return failure();
+    constant = *castedConstant;
+  }
+  if (failed(mlir::tosa::EqualizeRanks(rewriter, op->getLoc(), like, constant)))
+    return failure();
+  return constant;
 }
 
 // Create an int8_t const tosa.mul shift tensor from an int
@@ -237,6 +258,41 @@ std::optional<Value> getConstTensor<float>(PatternRewriter &rewriter,
         .value();
   }
   return const_op.getResult();
+}
+
+template <typename T>
+std::optional<Value>
+getSplatConstTensor(PatternRewriter &rewriter, Operation *op, T value,
+                    ArrayRef<int64_t> shape, std::optional<Type> dtype) {
+  auto width = sizeof(T) * 8;
+  if constexpr (std::is_same_v<T, bool>)
+    width = 1;
+
+  auto constType = RankedTensorType::get(shape, rewriter.getIntegerType(width));
+  auto constAttr = DenseElementsAttr::get(constType, value);
+  Value constTensor =
+      tosa::ConstOp::create(rewriter, op->getLoc(), constType, constAttr);
+
+  if (dtype)
+    return tosa::tosaCastTensorToType(rewriter, constTensor,
+                                      RankedTensorType::get(shape, *dtype));
+  return constTensor;
+}
+
+template <>
+std::optional<Value> getSplatConstTensor<float>(PatternRewriter &rewriter,
+                                                Operation *op, float value,
+                                                ArrayRef<int64_t> shape,
+                                                std::optional<Type> dtype) {
+  auto constType = RankedTensorType::get(shape, rewriter.getF32Type());
+  auto constAttr = DenseElementsAttr::get(constType, value);
+  Value constTensor =
+      tosa::ConstOp::create(rewriter, op->getLoc(), constType, constAttr);
+
+  if (dtype)
+    return tosa::tosaCastTensorToType(rewriter, constTensor,
+                                      RankedTensorType::get(shape, *dtype));
+  return constTensor;
 }
 
 // Valid TOSA casting pairs according to TOSA spec:
@@ -381,6 +437,42 @@ std::optional<Value> tosaCastTensorToType(PatternRewriter &rewriter, Value src,
   return tosa::CastOp::create(rewriter, op->getLoc(), castedSrcType, src);
 }
 
+Value legalizeArgMaxInputType(PatternRewriter &rewriter, Operation *op,
+                              Value input) {
+  auto inputTy = cast<RankedTensorType>(input.getType());
+  auto elemTy = inputTy.getElementType();
+  // Keep i8 as-is (supported by TOSA pro_int argmax). Cast other integer
+  // types to f32, including i1 (handled via i1->i8->f32).
+  if (!elemTy.isInteger() || elemTy.isInteger(8))
+    return input;
+  auto castTy =
+      RankedTensorType::get(inputTy.getShape(), rewriter.getF32Type());
+  auto casted = tosa::tosaCastTensorToType(rewriter, input, castTy);
+  return casted ? *casted : input;
+}
+
+// Create a tosa.gather op. Casts i1 inputs to i8 internally if needed.
+std::optional<Value> createGatherOp(PatternRewriter &rewriter, Location loc,
+                                    RankedTensorType resultType, Value input,
+                                    Value indices) {
+  if (tosa::isI1Type(resultType)) {
+    auto i8Ty = rewriter.getI8Type();
+    auto inputTy = dyn_cast<RankedTensorType>(input.getType());
+    if (!inputTy)
+      return std::nullopt;
+    auto inputI8Ty = inputTy.clone(i8Ty);
+    auto inputI8 =
+        tosa::tosaCastTensorToType(rewriter, input, inputI8Ty).value();
+    auto gatherI8Ty = resultType.clone(i8Ty);
+    auto gatheredI8 =
+        tosa::GatherOp::create(rewriter, loc, gatherI8Ty, inputI8, indices);
+    return tosa::tosaCastTensorToType(rewriter, gatheredI8, resultType).value();
+  }
+
+  return tosa::GatherOp::create(rewriter, loc, resultType, input, indices)
+      .getResult();
+}
+
 // Template instantiation
 template std::optional<Value>
 getConstTensor<bool>(PatternRewriter &, Operation *, ArrayRef<bool> vec,
@@ -401,6 +493,29 @@ getConstTensor<int32_t>(PatternRewriter &, Operation *, ArrayRef<int32_t> vec,
 template std::optional<Value>
 getConstTensor<int64_t>(PatternRewriter &, Operation *, ArrayRef<int64_t> vec,
                         ArrayRef<int64_t> shape, std::optional<Type> dtype);
+
+template std::optional<Value>
+getSplatConstTensor<bool>(PatternRewriter &, Operation *, bool value,
+                          ArrayRef<int64_t> shape, std::optional<Type> dtype);
+
+template std::optional<Value>
+getSplatConstTensor<int8_t>(PatternRewriter &, Operation *, int8_t value,
+                            ArrayRef<int64_t> shape, std::optional<Type> dtype);
+
+template std::optional<Value>
+getSplatConstTensor<int16_t>(PatternRewriter &, Operation *, int16_t value,
+                             ArrayRef<int64_t> shape,
+                             std::optional<Type> dtype);
+
+template std::optional<Value>
+getSplatConstTensor<int32_t>(PatternRewriter &, Operation *, int32_t value,
+                             ArrayRef<int64_t> shape,
+                             std::optional<Type> dtype);
+
+template std::optional<Value>
+getSplatConstTensor<int64_t>(PatternRewriter &, Operation *, int64_t value,
+                             ArrayRef<int64_t> shape,
+                             std::optional<Type> dtype);
 
 LogicalResult getAvgPool2dAccType(PatternRewriter &rewriter, Value input,
                                   TypeAttr &accType) {
@@ -454,8 +569,7 @@ LogicalResult getConvOpsAccType(PatternRewriter &rewriter,
              (weightElemTy.isInteger(8) || weightElemTy.isInteger(4)) &&
              outputElemTy.isInteger(32)) {
     accType = mlir::TypeAttr::get(rewriter.getIntegerType(32));
-  } else if (inputElemTy.isInteger(16) && weightElemTy.isInteger(8) &&
-             outputElemTy.isInteger(48)) {
+  } else if (inputElemTy.isInteger(16)) {
     accType = mlir::TypeAttr::get(rewriter.getIntegerType(48));
   } else if ((isa<Float8E4M3Type>(inputElemTy) &&
               isa<Float8E4M3Type>(weightElemTy) && outputElemTy.isF16()) ||
@@ -504,14 +618,10 @@ FailureOr<Value> getConvBiasForNoneType(Operation *op,
 
   int32_t oc = static_cast<int32_t>(numOutputChannels);
 
-  if (biasElemTy.isInteger()) {
-    SmallVector<int32_t> zeroVec(oc, 0);
-    return tosa::getConstTensor<int32_t>(rewriter, op, zeroVec, {oc}).value();
-  } else {
-    SmallVector<float> zeroVec(oc, 0);
-    return tosa::getConstTensor<float>(rewriter, op, zeroVec, {oc}, biasElemTy)
-        .value();
-  }
+  if (biasElemTy.isInteger())
+    return tosa::getSplatConstTensor<int32_t>(rewriter, op, 0, {oc}).value();
+  return tosa::getSplatConstTensor<float>(rewriter, op, 0.0f, {oc}, biasElemTy)
+      .value();
 }
 
 Value emitExplicitZeroPadNHWC(Location loc, PatternRewriter &rewriter,
@@ -578,6 +688,54 @@ FailureOr<Value> getZeroPointValue(PatternRewriter &rewriter, Operation *op,
   }
 
   return zp;
+}
+
+bool typeHasZeroDim(ShapedType type) {
+  auto outShape = type.getShape();
+  return llvm::any_of(outShape, [](int64_t dim) { return dim == 0; });
+}
+
+bool isI1Type(Type type) {
+  if (auto shapedTy = dyn_cast<ShapedType>(type))
+    type = shapedTy.getElementType();
+  if (auto intTy = dyn_cast<IntegerType>(type))
+    return intTy.getWidth() == 1;
+  return false;
+}
+
+void computeResizeParams(int inputSize, int outputSize, bool alignCorners,
+                         tosa::ResizeMode mode, int &scaleN, int &scaleD,
+                         int &offset, int &border) {
+  // Dimension is length 1, we are just sampling from one value.
+  if (inputSize == 1) {
+    scaleN = outputSize;
+    scaleD = 1;
+    offset = 0;
+    border = outputSize - 1;
+    return;
+  }
+
+  // Apply if aligned and capable to be aligned.
+  bool applyAligned = alignCorners && (outputSize > 1);
+  scaleN = applyAligned ? (outputSize - 1) : outputSize;
+  scaleD = applyAligned ? (inputSize - 1) : inputSize;
+
+  // Simplify the scalers, make sure they are even values.
+  int gcd = std::gcd(scaleN, scaleD);
+  scaleN = 2 * scaleN / gcd;
+  scaleD = 2 * scaleD / gcd;
+
+  offset = 0;
+  if (mode == tosa::ResizeMode::BILINEAR && !applyAligned) {
+    // Set offset to match PyTorch half-pixel centers
+    offset = (scaleD - scaleN) / 2;
+  } else if (mode == tosa::ResizeMode::NEAREST_NEIGHBOR && alignCorners) {
+    // If nearest neighbors we need to guarantee we round up.
+    offset = scaleN / 2;
+  }
+
+  // We can compute this directly based on previous values.
+  border = scaleD * (outputSize - 1) - scaleN * (inputSize - 1) + offset;
 }
 
 } // namespace tosa

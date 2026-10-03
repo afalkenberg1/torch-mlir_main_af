@@ -1,4 +1,4 @@
-// RUN: torch-mlir-opt <%s -convert-torch-to-tosa --canonicalize -split-input-file | FileCheck %s
+// RUN: torch-mlir-opt <%s -convert-torch-to-tosa --canonicalize -split-input-file -verify-diagnostics | FileCheck %s
 // COM: --canonicalize is used to clean up the IR after conversion to make resulting IR easier to read
 
 
@@ -45,30 +45,31 @@ func.func @AtenMmQint8(%arg0: !torch.vtensor<[3,4],si8>, %arg1: !torch.vtensor<[
 
 // -----
 // CHECK-LABEL:   func.func @quantization_per_tensor(
-// CHECK-SAME:      %[[IN:.*]]: !torch.vtensor<[2,4,4],f32>) -> !torch.vtensor<[2,4,4],!torch.qint8> {
-// CHECK:           %[[ZP:.*]] = "tosa.const"() <{values = dense<3> : tensor<1x1x1xi8>}> : () -> tensor<1x1x1xi8>
-// CHECK:           %[[C2:.*]] = "tosa.const"() <{values = dense<2.000000e+00> : tensor<1x1x1xf32>}> : () -> tensor<1x1x1xf32>
-// CHECK:           %[[CHALF:.*]] = "tosa.const"() <{values = dense<5.000000e-01> : tensor<1x1x1xf32>}> : () -> tensor<1x1x1xf32>
-// CHECK:           %[[C10:.*]] = "tosa.const"() <{values = dense<1.000000e+01> : tensor<1x1x1xf32>}> : () -> tensor<1x1x1xf32>
-// CHECK:           %[[MUL_SHIFT:.*]] = "tosa.const"() <{values = dense<0> : tensor<1xi8>}> : () -> tensor<1xi8>
-// CHECK:           %[[IN_TENSOR:.*]] = torch_c.to_builtin_tensor %[[IN]] : !torch.vtensor<[2,4,4],f32> -> tensor<2x4x4xf32>
-// CHECK:           %[[RESCALE:.*]] = tosa.mul %[[IN_TENSOR]], %[[C10]], %[[MUL_SHIFT]] : (tensor<2x4x4xf32>, tensor<1x1x1xf32>, tensor<1xi8>) -> tensor<2x4x4xf32>
-// CHECK:           %[[FLOOR:.*]] = tosa.floor %[[RESCALE]] : (tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
-// CHECK:           %[[FRAC:.*]] = tosa.sub %[[RESCALE]], %[[FLOOR]] : (tensor<2x4x4xf32>, tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
-// CHECK:           %[[CEIL:.*]] = tosa.ceil %[[RESCALE]] : (tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
-// CHECK:           %[[FLOOR_DIV_BY_2:.*]] = tosa.mul %[[FLOOR]], %[[CHALF]], %[[MUL_SHIFT]] : (tensor<2x4x4xf32>, tensor<1x1x1xf32>, tensor<1xi8>) -> tensor<2x4x4xf32>
-// CHECK:           %[[FLOOR_DIV:.*]] = tosa.floor %[[FLOOR_DIV_BY_2]] : (tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
-// CHECK:           %[[EVEN_COMP:.*]] = tosa.mul %[[FLOOR_DIV]], %[[C2]], %[[MUL_SHIFT]] : (tensor<2x4x4xf32>, tensor<1x1x1xf32>, tensor<1xi8>) -> tensor<2x4x4xf32>
-// CHECK:           %[[FLOOR_INPUT_EVEN:.*]] = tosa.equal %[[FLOOR]], %[[EVEN_COMP]] : (tensor<2x4x4xf32>, tensor<2x4x4xf32>) -> tensor<2x4x4xi1>
-// CHECK:           %[[FRAC_EQ_HALF:.*]] = tosa.equal %[[FRAC]], %[[CHALF]] : (tensor<2x4x4xf32>, tensor<1x1x1xf32>) -> tensor<2x4x4xi1>
-// CHECK:           %[[GRTR:.*]] = tosa.greater %[[CHALF]], %[[FRAC]] : (tensor<1x1x1xf32>, tensor<2x4x4xf32>) -> tensor<2x4x4xi1>
-// CHECK:           %[[AND:.*]] = tosa.logical_and %[[FRAC_EQ_HALF]], %[[FLOOR_INPUT_EVEN]] : (tensor<2x4x4xi1>, tensor<2x4x4xi1>) -> tensor<2x4x4xi1>
-// CHECK:           %[[OR:.*]] = tosa.logical_or %[[GRTR]], %[[AND]] : (tensor<2x4x4xi1>, tensor<2x4x4xi1>) -> tensor<2x4x4xi1>
-// CHECK:           %[[SELECT:.*]] = tosa.select %[[OR]], %[[FLOOR]], %[[CEIL]] : (tensor<2x4x4xi1>, tensor<2x4x4xf32>, tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
-// CHECK:           %[[CAST:.*]] = tosa.cast %[[SELECT]] : (tensor<2x4x4xf32>) -> tensor<2x4x4xi8>
-// CHECK:           %[[ADD:.*]] = tosa.add %[[CAST]], %[[ZP]] : (tensor<2x4x4xi8>, tensor<1x1x1xi8>) -> tensor<2x4x4xi8>
-// CHECK:           %[[RES:.*]] = torch_c.from_builtin_tensor %[[ADD]] : tensor<2x4x4xi8> -> !torch.vtensor<[2,4,4],!torch.qint8>
-// CHECK:           return %[[RES]]
+// CHECK-SAME:      %[[ARG0:.*]]: !torch.vtensor<[2,4,4],f32>) -> !torch.vtensor<[2,4,4],!torch.qint8> {
+// CHECK:           %[[VAL_0:.*]] = "tosa.const"() <{values = dense<3.000000e+00> : tensor<1x1x1xf32>}> : () -> tensor<1x1x1xf32>
+// CHECK:           %[[VAL_1:.*]] = "tosa.const"() <{values = dense<2.000000e+00> : tensor<1x1x1xf32>}> : () -> tensor<1x1x1xf32>
+// CHECK:           %[[VAL_2:.*]] = "tosa.const"() <{values = dense<5.000000e-01> : tensor<1x1x1xf32>}> : () -> tensor<1x1x1xf32>
+// CHECK:           %[[VAL_3:.*]] = "tosa.const"() <{values = dense<1.000000e+01> : tensor<1x1x1xf32>}> : () -> tensor<1x1x1xf32>
+// CHECK:           %[[VAL_4:.*]] = "tosa.const"() <{values = dense<0> : tensor<1xi8>}> : () -> tensor<1xi8>
+// CHECK:           %[[TO_BUILTIN_TENSOR_0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[2,4,4],f32> -> tensor<2x4x4xf32>
+// CHECK:           %[[MUL_0:.*]] = tosa.mul %[[TO_BUILTIN_TENSOR_0]], %[[VAL_3]], %[[VAL_4]] : (tensor<2x4x4xf32>, tensor<1x1x1xf32>, tensor<1xi8>) -> tensor<2x4x4xf32>
+// CHECK:           %[[FLOOR_0:.*]] = tosa.floor %[[MUL_0]] : (tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
+// CHECK:           %[[SUB_0:.*]] = tosa.sub %[[MUL_0]], %[[FLOOR_0]] : (tensor<2x4x4xf32>, tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
+// CHECK:           %[[CEIL_0:.*]] = tosa.ceil %[[MUL_0]] : (tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
+// CHECK:           %[[MUL_1:.*]] = tosa.mul %[[FLOOR_0]], %[[VAL_2]], %[[VAL_4]] : (tensor<2x4x4xf32>, tensor<1x1x1xf32>, tensor<1xi8>) -> tensor<2x4x4xf32>
+// CHECK:           %[[FLOOR_1:.*]] = tosa.floor %[[MUL_1]] : (tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
+// CHECK:           %[[MUL_2:.*]] = tosa.mul %[[FLOOR_1]], %[[VAL_1]], %[[VAL_4]] : (tensor<2x4x4xf32>, tensor<1x1x1xf32>, tensor<1xi8>) -> tensor<2x4x4xf32>
+// CHECK:           %[[EQUAL_0:.*]] = tosa.equal %[[FLOOR_0]], %[[MUL_2]] : (tensor<2x4x4xf32>, tensor<2x4x4xf32>) -> tensor<2x4x4xi1>
+// CHECK:           %[[EQUAL_1:.*]] = tosa.equal %[[SUB_0]], %[[VAL_2]] : (tensor<2x4x4xf32>, tensor<1x1x1xf32>) -> tensor<2x4x4xi1>
+// CHECK:           %[[GREATER_0:.*]] = tosa.greater %[[VAL_2]], %[[SUB_0]] : (tensor<1x1x1xf32>, tensor<2x4x4xf32>) -> tensor<2x4x4xi1>
+// CHECK:           %[[LOGICAL_AND_0:.*]] = tosa.logical_and %[[EQUAL_1]], %[[EQUAL_0]] : (tensor<2x4x4xi1>, tensor<2x4x4xi1>) -> tensor<2x4x4xi1>
+// CHECK:           %[[LOGICAL_OR_0:.*]] = tosa.logical_or %[[GREATER_0]], %[[LOGICAL_AND_0]] : (tensor<2x4x4xi1>, tensor<2x4x4xi1>) -> tensor<2x4x4xi1>
+// CHECK:           %[[SELECT_0:.*]] = tosa.select %[[LOGICAL_OR_0]], %[[FLOOR_0]], %[[CEIL_0]] : (tensor<2x4x4xi1>, tensor<2x4x4xf32>, tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
+// CHECK:           %[[ADD_0:.*]] = tosa.add %[[SELECT_0]], %[[VAL_0]] : (tensor<2x4x4xf32>, tensor<1x1x1xf32>) -> tensor<2x4x4xf32>
+// CHECK:           %[[CLAMP_0:.*]] = tosa.clamp %[[ADD_0]] {max_val = 1.270000e+02 : f32, min_val = -1.280000e+02 : f32} : (tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
+// CHECK:           %[[CAST_0:.*]] = tosa.cast %[[CLAMP_0]] : (tensor<2x4x4xf32>) -> tensor<2x4x4xi8>
+// CHECK:           %[[FROM_BUILTIN_TENSOR_0:.*]] = torch_c.from_builtin_tensor %[[CAST_0]] : tensor<2x4x4xi8> -> !torch.vtensor<[2,4,4],!torch.qint8>
+// CHECK:           return %[[FROM_BUILTIN_TENSOR_0]]
 func.func @quantization_per_tensor(%arg0: !torch.vtensor<[2,4,4],f32>) -> !torch.vtensor<[2,4,4],!torch.qint8> {
   %dtype = torch.constant.int 12
   %scale = torch.constant.float 0.1
@@ -137,4 +138,166 @@ func.func @quantized_conv(%arg0: !torch.vtensor<[?,4,7,8],si8>, %arg1: !torch.vt
   %10 = torch.aten._make_per_tensor_quantized_tensor %9, %float1.000000e-04, %int0 : !torch.vtensor<[?,3,5,7],si32>, !torch.float, !torch.int -> !torch.vtensor<[?,3,5,7],!torch.qint32>
   %11 = torch.aten.dequantize.tensor %10 : !torch.vtensor<[?,3,5,7],!torch.qint32> -> !torch.vtensor<[?,3,5,7],f32>
   return %11 : !torch.vtensor<[?,3,5,7],f32>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @quantized_conv_i16(
+// CHECK:           %[[CONV:.*]] = tosa.conv2d
+// CHECK-SAME:      {acc_type = i48,
+func.func @quantized_conv_i16(%arg0: !torch.vtensor<[?,4,7,8],si16>, %arg1: !torch.vtensor<[3,4,3,2],si16>, %arg2: !torch.vtensor<[?],f32>) -> !torch.vtensor<[?,3,5,7],f32> {
+  %false = torch.constant.bool false
+  %int1 = torch.constant.int 1
+  %int0 = torch.constant.int 0
+  %float1.000000e-04 = torch.constant.float 1.000000e-04
+  %int3 = torch.constant.int 3
+  %int7 = torch.constant.int 7
+  %float1.000000e-02 = torch.constant.float 1.000000e-02
+  %int14 = torch.constant.int 14
+  %0 = torch.aten.quantize_per_tensor %arg2, %float1.000000e-04, %int0, %int14 : !torch.vtensor<[?],f32>, !torch.float, !torch.int, !torch.int -> !torch.vtensor<[?],!torch.qint32>
+  %1 = torch.aten.dequantize.self %0 : !torch.vtensor<[?],!torch.qint32> -> !torch.vtensor<[?],f32>
+  %2 = torch.prim.ListConstruct %int1, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %3 = torch.prim.ListConstruct %int0, %int0 : (!torch.int, !torch.int) -> !torch.list<int>
+  %4 = torch.prim.ListConstruct  : () -> !torch.list<int>
+  // TOSA spec requires zero-point = 0 for non-int8 integer convs.
+  %5 = torch.aten._make_per_tensor_quantized_tensor %arg0, %float1.000000e-02, %int0 : !torch.vtensor<[?,4,7,8],si16>, !torch.float, !torch.int -> !torch.vtensor<[?,4,7,8],!torch.qint16>
+  %6 = torch.aten._make_per_tensor_quantized_tensor %arg1, %float1.000000e-02, %int0 : !torch.vtensor<[3,4,3,2],si16>, !torch.float, !torch.int -> !torch.vtensor<[3,4,3,2],!torch.qint16>
+  %7 = torch.aten.quantize_per_tensor %1, %float1.000000e-04, %int0, %int14 : !torch.vtensor<[?],f32>, !torch.float, !torch.int, !torch.int -> !torch.vtensor<[?],!torch.qint32>
+  %8 = torch.aten.int_repr %7 : !torch.vtensor<[?],!torch.qint32> -> !torch.vtensor<[?],si32>
+  %9 = torch.aten.convolution %5, %6, %8, %2, %3, %2, %false, %4, %int1 : !torch.vtensor<[?,4,7,8],!torch.qint16>, !torch.vtensor<[3,4,3,2],!torch.qint16>, !torch.vtensor<[?],si32>, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.bool, !torch.list<int>, !torch.int -> !torch.vtensor<[?,3,5,7],si32>
+  %10 = torch.aten._make_per_tensor_quantized_tensor %9, %float1.000000e-04, %int0 : !torch.vtensor<[?,3,5,7],si32>, !torch.float, !torch.int -> !torch.vtensor<[?,3,5,7],!torch.qint32>
+  %11 = torch.aten.dequantize.tensor %10 : !torch.vtensor<[?,3,5,7],!torch.qint32> -> !torch.vtensor<[?,3,5,7],f32>
+  return %11 : !torch.vtensor<[?,3,5,7],f32>
+}
+
+// -----
+
+// Positive test: PT2E torch.quantized_decomposed.dequantize_per_tensor with
+// static-shape i8 input and constant qparams.
+// Checks: cast -> sub -> cast -> mul sequence emitted by the pattern.
+
+// CHECK-LABEL:   func.func @dequantize_per_tensor_basic(
+// CHECK-SAME:      %[[ARG0:.*]]: !torch.vtensor<[4,8],si8>) -> !torch.vtensor<[4,8],f32> {
+// CHECK-DAG:       %[[SCALE:.*]] = "tosa.const"() <{values = dense<3.000000e-02> : tensor<1x1xf32>}> : () -> tensor<1x1xf32>
+// CHECK-DAG:       %[[ZP:.*]] = "tosa.const"() <{values = dense<-10> : tensor<1x1xi32>}> : () -> tensor<1x1xi32>
+// CHECK:           %[[BUILTIN:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[4,8],si8> -> tensor<4x8xi8>
+// CHECK:           %[[CAST_INT:.*]] = tosa.cast %[[BUILTIN]] : (tensor<4x8xi8>) -> tensor<4x8xi32>
+// CHECK:           %[[SUB:.*]] = tosa.sub %[[CAST_INT]], %[[ZP]] : (tensor<4x8xi32>, tensor<1x1xi32>) -> tensor<4x8xi32>
+// CHECK:           %[[CAST_FP:.*]] = tosa.cast %[[SUB]] : (tensor<4x8xi32>) -> tensor<4x8xf32>
+// CHECK:           %[[MUL:.*]] = tosa.mul %[[CAST_FP]], %[[SCALE]]
+// CHECK:           %[[RES:.*]] = torch_c.from_builtin_tensor %[[MUL]] : tensor<4x8xf32> -> !torch.vtensor<[4,8],f32>
+// CHECK:           return %[[RES]]
+// CHECK-NOT:       torch.quantized_decomposed.dequantize_per_tensor
+func.func @dequantize_per_tensor_basic(%arg0: !torch.vtensor<[4,8],si8>) -> !torch.vtensor<[4,8],f32> {
+  %scale = torch.constant.float 3.000000e-02
+  %zp = torch.constant.int -10
+  %qmin = torch.constant.int -128
+  %qmax = torch.constant.int 127
+  %dtype = torch.constant.int 1
+  %none = torch.constant.none
+  %0 = torch.quantized_decomposed.dequantize_per_tensor %arg0, %scale, %zp, %qmin, %qmax, %dtype, %none
+      : !torch.vtensor<[4,8],si8>, !torch.float, !torch.int, !torch.int, !torch.int, !torch.int, !torch.none
+      -> !torch.vtensor<[4,8],f32>
+  return %0 : !torch.vtensor<[4,8],f32>
+}
+
+// -----
+
+// Negative test: SSA (non-constant) scale on PT2E dequantize -> pattern bails
+// out; the conversion pass reports the op as illegally unconverted.
+
+func.func @dequantize_per_tensor_dynamic_scale(%arg0: !torch.vtensor<[4,8],si8>, %scale: !torch.float) -> !torch.vtensor<[4,8],f32> {
+  %zp = torch.constant.int -10
+  %qmin = torch.constant.int -128
+  %qmax = torch.constant.int 127
+  %dtype = torch.constant.int 1
+  %none = torch.constant.none
+  // expected-error @+1 {{failed to legalize operation 'torch.quantized_decomposed.dequantize_per_tensor' that was explicitly marked illegal}}
+  %0 = torch.quantized_decomposed.dequantize_per_tensor %arg0, %scale, %zp, %qmin, %qmax, %dtype, %none
+      : !torch.vtensor<[4,8],si8>, !torch.float, !torch.int, !torch.int, !torch.int, !torch.int, !torch.none
+      -> !torch.vtensor<[4,8],f32>
+  return %0 : !torch.vtensor<[4,8],f32>
+}
+
+// -----
+
+// Positive test: PT2E torch.quantized_decomposed.quantize_per_tensor with
+// static-shape f32 input and constant qparams.
+// Checks: mul -> clamp -> cast sequence.
+
+// CHECK-LABEL:   func.func @quantize_per_tensor_basic(
+// CHECK:           torch_c.to_builtin_tensor
+// CHECK:           tosa.mul
+// CHECK:           tosa.clamp
+// CHECK:           tosa.cast
+// CHECK:           torch_c.from_builtin_tensor {{.*}} : tensor<4x8xi8> -> !torch.vtensor<[4,8],si8>
+// CHECK-NOT:       torch.quantized_decomposed.quantize_per_tensor
+func.func @quantize_per_tensor_basic(%arg0: !torch.vtensor<[4,8],f32>) -> !torch.vtensor<[4,8],si8> {
+  %scale = torch.constant.float 3.000000e-02
+  %zp = torch.constant.int -10
+  %qmin = torch.constant.int -128
+  %qmax = torch.constant.int 127
+  %dtype = torch.constant.int 1
+  %0 = torch.quantized_decomposed.quantize_per_tensor %arg0, %scale, %zp, %qmin, %qmax, %dtype
+      : !torch.vtensor<[4,8],f32>, !torch.float, !torch.int, !torch.int, !torch.int, !torch.int
+      -> !torch.vtensor<[4,8],si8>
+  return %0 : !torch.vtensor<[4,8],si8>
+}
+
+// -----
+
+// Negative test: SSA (non-constant) scale on PT2E quantize -> pattern bails
+// out; the conversion pass reports the op as illegally unconverted.
+
+func.func @quantize_per_tensor_dynamic_scale(%arg0: !torch.vtensor<[4,8],f32>, %scale: !torch.float) -> !torch.vtensor<[4,8],si8> {
+  %zp = torch.constant.int -10
+  %qmin = torch.constant.int -128
+  %qmax = torch.constant.int 127
+  %dtype = torch.constant.int 1
+  // expected-error @+1 {{failed to legalize operation 'torch.quantized_decomposed.quantize_per_tensor' that was explicitly marked illegal}}
+  %0 = torch.quantized_decomposed.quantize_per_tensor %arg0, %scale, %zp, %qmin, %qmax, %dtype
+      : !torch.vtensor<[4,8],f32>, !torch.float, !torch.int, !torch.int, !torch.int, !torch.int
+      -> !torch.vtensor<[4,8],si8>
+  return %0 : !torch.vtensor<[4,8],si8>
+}
+
+// -----
+
+// Negative test: zero scale on PT2E quantize -> pattern bails out (quantize
+// divides by scale), so the op is reported as illegally unconverted.
+
+func.func @quantize_per_tensor_zero_scale(%arg0: !torch.vtensor<[4,8],f32>) -> !torch.vtensor<[4,8],si8> {
+  %scale = torch.constant.float 0.000000e+00
+  %zp = torch.constant.int -10
+  %qmin = torch.constant.int -128
+  %qmax = torch.constant.int 127
+  %dtype = torch.constant.int 1
+  // expected-error @+1 {{failed to legalize operation 'torch.quantized_decomposed.quantize_per_tensor' that was explicitly marked illegal}}
+  %0 = torch.quantized_decomposed.quantize_per_tensor %arg0, %scale, %zp, %qmin, %qmax, %dtype
+      : !torch.vtensor<[4,8],f32>, !torch.float, !torch.int, !torch.int, !torch.int, !torch.int
+      -> !torch.vtensor<[4,8],si8>
+  return %0 : !torch.vtensor<[4,8],si8>
+}
+
+// -----
+
+// Positive test: PT2E dequantize with a dynamic (SSA) quant_min still
+// legalizes -- quant_min / quant_max are metadata unused by the dequantize
+// arithmetic, so they need not be constant.
+
+// CHECK-LABEL:   func.func @dequantize_per_tensor_dynamic_quant_min(
+// CHECK:           tosa.cast
+// CHECK:           tosa.sub
+// CHECK:           tosa.mul
+// CHECK-NOT:       torch.quantized_decomposed.dequantize_per_tensor
+func.func @dequantize_per_tensor_dynamic_quant_min(%arg0: !torch.vtensor<[4,8],si8>, %qmin: !torch.int) -> !torch.vtensor<[4,8],f32> {
+  %scale = torch.constant.float 3.000000e-02
+  %zp = torch.constant.int -10
+  %qmax = torch.constant.int 127
+  %dtype = torch.constant.int 1
+  %none = torch.constant.none
+  %0 = torch.quantized_decomposed.dequantize_per_tensor %arg0, %scale, %zp, %qmin, %qmax, %dtype, %none
+      : !torch.vtensor<[4,8],si8>, !torch.float, !torch.int, !torch.int, !torch.int, !torch.int, !torch.none
+      -> !torch.vtensor<[4,8],f32>
+  return %0 : !torch.vtensor<[4,8],f32>
 }

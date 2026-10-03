@@ -3,18 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
-load("@com_github_bazelbuild_buildtools//buildifier:def.bzl", "buildifier")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
 package(
     default_visibility = [
         "//visibility:public",
     ],
-)
-
-# Format bazel BUILD and .bzl files with a standard convention
-# Invoke as `bazel run @torch-mlir//:buildifier`
-buildifier(
-    name = "buildifier",
 )
 
 # Torch Dialect/IR
@@ -91,7 +85,6 @@ gentbl_cc_library(
 cc_library(
     name = "TorchMLIRTorchDialectUtils",
     srcs = [
-        "lib/Dialect/Torch/Utils/SparsityUtils.cpp",
         "lib/Dialect/Torch/Utils/TorchUpstream.cpp",
         "lib/Dialect/Torch/Utils/Utils.cpp",
     ],
@@ -99,7 +92,6 @@ cc_library(
         "include/torch-mlir/Dialect/Torch/IR/TorchOps.h",
         "include/torch-mlir/Dialect/Torch/IR/TorchTraits.h",
         "include/torch-mlir/Dialect/Torch/IR/TorchTypes.h",
-        "include/torch-mlir/Dialect/Torch/Utils/SparsityUtils.h",
         "include/torch-mlir/Dialect/Torch/Utils/TorchUpstream.h",
         "include/torch-mlir/Dialect/Torch/Utils/Utils.h",
     ],
@@ -291,6 +283,16 @@ gentbl_cc_library(
     ],
 )
 
+cc_library(
+    name = "TorchMLIRConversionPassHeaders",
+    hdrs = ["include/torch-mlir/Conversion/Passes.h"],
+    strip_include_prefix = "include",
+    deps = [
+        ":TorchMLIRConversionPassesIncGen",
+        "@llvm-project//mlir:Pass",
+    ],
+)
+
 td_library(
     name = "TorchMLIRConversionTorchOnnxToTorchPassTdFiles",
     srcs = [
@@ -370,14 +372,13 @@ cc_library(
 cc_library(
     name = "TorchMLIRTorchToLinalg",
     srcs = glob([
-        "lib/Conversion/*.h",
         "lib/Conversion/TorchToLinalg/*.cpp",
         "lib/Conversion/TorchToLinalg/*.h",
     ]),
     hdrs = glob(["include/torch-mlir/Conversion/TorchToLinalg/*.h"]),
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
@@ -395,13 +396,12 @@ cc_library(
 cc_library(
     name = "TorchMLIRTorchToSCF",
     srcs = glob([
-        "lib/Conversion/*.h",
         "lib/Conversion/TorchToSCF/*.cpp",
     ]),
     hdrs = glob(["include/torch-mlir/Conversion/TorchToSCF/*.h"]),
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
         "@llvm-project//mlir:ArithDialect",
@@ -417,7 +417,6 @@ cc_library(
 cc_library(
     name = "TorchMLIRTorchToArith",
     srcs = glob([
-        "lib/Conversion/*.h",
         "lib/Conversion/TorchToArith/*.cpp",
     ]),
     hdrs = glob([
@@ -425,7 +424,7 @@ cc_library(
     ]),
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
@@ -436,7 +435,6 @@ cc_library(
 cc_library(
     name = "TorchMLIRTorchToTensor",
     srcs = glob([
-        "lib/Conversion/*.h",
         "lib/Conversion/TorchToTensor/*.cpp",
     ]),
     hdrs = glob([
@@ -444,7 +442,7 @@ cc_library(
     ]),
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
@@ -459,7 +457,6 @@ cc_library(
 cc_library(
     name = "TorchMLIRTorchConversionToMLProgram",
     srcs = glob([
-        "lib/Conversion/*.h",
         "lib/Conversion/TorchConversionToMLProgram/*.cpp",
     ]),
     hdrs = glob([
@@ -467,7 +464,7 @@ cc_library(
     ]),
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
@@ -480,13 +477,12 @@ cc_library(
 cc_library(
     name = "TorchMLIRTorchToTMTensor",
     srcs = glob([
-        "lib/Conversion/*.h",
         "lib/Conversion/TorchToTMTensor/*.cpp",
     ]),
     hdrs = glob(["include/torch-mlir/Conversion/TorchToTMTensor/*.h"]),
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTMTensorDialect",
         ":TorchMLIRTorchBackendTypeConversion",
@@ -498,7 +494,6 @@ cc_library(
 cc_library(
     name = "TorchMLIRTorchToStablehlo",
     srcs = glob([
-        "lib/Conversion/*.h",
         "lib/Conversion/TorchToStablehlo/*.h",
         "lib/Conversion/TorchToStablehlo/*.cpp",
     ]),
@@ -508,7 +503,7 @@ cc_library(
     ],
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
@@ -521,13 +516,13 @@ cc_library(
 cc_library(
     name = "TorchMLIRTorchOnnxToTorch",
     srcs = glob([
-        "lib/Conversion/TorchOnnxToTorch/*.h",
         "lib/Conversion/TorchOnnxToTorch/*.cpp",
     ]),
     hdrs = glob(["include/torch-mlir/Conversion/TorchOnnxToTorch/*.h"]),
     strip_include_prefix = "include",
     deps = [
         ":TorchMLIRConversionTorchOnnxToTorchPassIncGen",
+        ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchDialect",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Pass",
@@ -548,8 +543,10 @@ cc_library(
     ],
     strip_include_prefix = "include",
     deps = [
+        ":TorchMLIRTorchConversionPasses",
         ":TorchMLIRTorchConversionToMLProgram",
         ":TorchMLIRTorchOnnxToTorch",
+        ":TorchMLIRTorchPasses",
         ":TorchMLIRTorchToArith",
         ":TorchMLIRTorchToLinalg",
         ":TorchMLIRTorchToSCF",
@@ -557,6 +554,7 @@ cc_library(
         ":TorchMLIRTorchToTMTensor",
         ":TorchMLIRTorchToTensor",
         ":TorchMLIRTorchToTosa",
+        "@llvm-project//mlir:ConversionPasses",
     ],
 )
 
@@ -564,7 +562,6 @@ cc_library(
     name = "TorchMLIRTorchConversionPasses",
     srcs = glob([
         "lib/Dialect/TorchConversion/Transforms/*.cpp",
-        "lib/Dialect/TorchConversion/Transforms/*.h",
     ]),
     hdrs = glob(["include/torch-mlir/Dialect/TorchConversion/Transforms/*.h"]),
     defines = [
@@ -586,6 +583,7 @@ cc_library(
         ":TorchMLIRTorchToTMTensor",
         ":TorchMLIRTorchToTensor",
         ":TorchMLIRTorchToTosa",
+        "@llvm-project//mlir:ControlFlowTransforms",
         "@llvm-project//mlir:ConversionPasses",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:LinalgDialect",
@@ -600,7 +598,6 @@ cc_library(
 cc_library(
     name = "TorchMLIRTorchToTosa",
     srcs = glob([
-        "lib/Conversion/*.h",
         "lib/Conversion/TorchToTosa/*.cpp",
     ]),
     hdrs = glob(["include/torch-mlir/Conversion/TorchToTosa/*.h"]),
@@ -609,7 +606,7 @@ cc_library(
     ],
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
@@ -632,6 +629,7 @@ cc_library(
     deps = [
         ":TorchMLIRTorchConversionDialect",
         "@llvm-project//mlir:FuncTransforms",
+        "@llvm-project//mlir:TensorDialect",
     ],
 )
 
@@ -809,7 +807,6 @@ cc_library(
         "lib/Dialect/TMTensor/Transforms/Passes.cpp",
     ],
     hdrs = [
-        "include/torch-mlir-dialects/Dialect/TMTensor/Transforms/PassDetail.h",
         "include/torch-mlir-dialects/Dialect/TMTensor/Transforms/Passes.h",
     ],
     strip_include_prefix = "include",
@@ -826,13 +823,6 @@ cc_library(
 )
 
 # RefBackend
-filegroup(
-    name = "TorchMLIRRefBackendPassesDetails",
-    srcs = [
-        "lib/RefBackend/PassDetail.h",
-    ],
-)
-
 td_library(
     name = "TorchMLIRRefBackendPassTdFiles",
     srcs = [
@@ -864,7 +854,7 @@ cc_library(
     name = "TorchMLIRRefBackendPass",
     srcs = [
         "lib/RefBackend/RefBackend.cpp",
-    ] + [":TorchMLIRRefBackendPassesDetails"],
+    ],
     hdrs = [
         "include/torch-mlir/RefBackend/Passes.h",
     ],
